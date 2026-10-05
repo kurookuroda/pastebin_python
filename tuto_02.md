@@ -73,7 +73,7 @@ pastebin/
 | `requirements.txt` | 必要なPythonパッケージを列挙 |
 | `pastes/` | 実際のPaste本文をテキストファイルとして保存 |
 | `templates/index.html` | 投稿フォームとPaste表示の両方を担当 |
-| `templates/404.html` | Pasteが見つかない場合の画面 |
+| `templates/404.html` | Pasteが見つからない場合の画面 |
 | `templates/413.html` | 投稿サイズが大きすぎる場合の画面 |
 | `static/style.css` | 画面の見た目を整える |
 
@@ -328,6 +328,7 @@ def create_paste():
                 file_path,
                 "x",
                 encoding="utf-8",
+                newline="\n",
             )
 
             return paste_id, file_path, file_object
@@ -367,6 +368,7 @@ def read_paste(paste_id):
             file_path,
             "r",
             encoding="utf-8",
+            newline="\n",
         ) as f:
             language = f.readline().rstrip("\n")
             content = f.read()
@@ -390,6 +392,7 @@ def index():
             abort(400)
 
         content = request.form.get("content", "")
+        content = content.replace("\r\n", "\n").replace("\r", "\n")
         language = sanitize_language(
             request.form.get("language", "text")
         )
@@ -783,7 +786,7 @@ URLから取得した `paste_id` をそのままファイルパスに使うと�
 /pastes/../../../etc/passwd
 ```
 
-これは実質的に `/etc/passwd` を指し、サーバーの機密ファイルが読み取られる可能性があります。この攻撃手法を**パストラバーサル（Path Traversal**と呼びます。
+これは実質的に `/etc/passwd` を指し、サーバーの機密ファイルが読み取られる可能性があります。この攻撃手法を**パストラバーサル（Path Traversal）**と呼びます。
 
 #### 正規表現の意味
 
@@ -876,7 +879,7 @@ Pygmentsに存在しない言語名を渡すと `ClassNotFound` 例外が発生�
 <script>document.getElementById("evil").submit();</script>
 ```
 
-Pastebinにログイン済み（セッションCookieを持っている）ユーザーがこのページを開くと、自動的にフォームが送信され、意図しないPasteが作成されます。
+セッションCookieで本人確認をしているサービスの場合、その利用者がこのページを開くと、ブラウザが自動的にCookie付きでフォームを送信し、本人の意図しない操作が実行されてしまいます。
 
 #### 対策：CSRFトークン
 
@@ -886,7 +889,15 @@ CSRF対策の基本は、**リクエストに秘密のトークンを含める**
 * フォームにhiddenフィールドとして埋め込む
 * 送信時にセッションのトークンと比較して一致を確認する
 
-悪意あるサイトはセッションCookieを読めないため（`HttpOnly` 属性のため）、正しいトークンをフォームに含めることができません。
+悪意あるサイトは、被害者向けに発行されたフォームページの中身（＝トークン）を読み取れません（ブラウザの**同一オリジンポリシー**による）。そのため、正しいトークンをフォームに含めることができません。
+
+なお、`HttpOnly` はJavaScriptからCookieを読めなくする別の対策であり、CSRFトークンが守られる理由そのものではありません。
+
+#### このアプリでのCSRF対策の位置づけ
+
+このPastebinにはログイン機能がなく、誰でも投稿できます。そのため、攻撃者は被害者のブラウザを使わなくても、自分で `POST /` を送れば同じことができます（自分のセッションでトークンを取得して送信するだけです）。
+
+つまり、このアプリではCSRFトークンが実質的に防いでいるものはほとんどなく、**学習用の実装**です。ログイン機能や、利用者ごとの操作（削除・編集など）を追加したときに、本来の効果を発揮します。スパム投稿への対策は、13.4 のレート制限の領域です。
 
 ---
 
@@ -903,7 +914,7 @@ def get_csrf_token():
 
 CSRFトークンを取得または生成します。
 
-* ッションに既にトークンがあれば、それを返す
+* セッションに既にトークンがあれば、それを返す
 * なければ `secrets.token_urlsafe(32)` で新しく生成し、セッションに保存
 
 `secrets` モジュールは暗号学的に安全な乱数を生成するため、トークンの予測が困難です。
@@ -951,6 +962,7 @@ def create_paste():
                 file_path,
                 "x",
                 encoding="utf-8",
+                newline="\n",
             )
 
             return paste_id, file_path, file_object
@@ -986,7 +998,7 @@ Pythonの `open()` 関数のモードには以下の種類があります。
 
 #### shortuuid.random(length=10) の衝突確率
 
-shortuuidはUUIDをBase57エンコーディングした文字列を生成します。10文字の場合、約 `10^18`（10の18乗）通りの組み合わせがあります。実用上、衝突の確率は無視できるレベルですが、理論的には可能性があるため、衝突時の再試行処理を入れています。
+shortuuidはUUIDをBase57エンコーディングした文字列を生成します。10文字の場合、約 `3.6 × 10^17`（57の10乗）通りの組み合わせがあります。実用上、衝突の確率は無視できるレベルですが、理論的には可能性があるため、衝突時の再試行処理を入れています。
 
 ### 5.8 Pasteの読み込み
 
@@ -1026,6 +1038,7 @@ def read_paste(paste_id):
             file_path,
             "r",
             encoding="utf-8",
+            newline="\n",
         ) as f:
             language = f.readline().rstrip("\n")
             content = f.read()
@@ -1051,6 +1064,8 @@ def hello():
 `readline()` で1行目を読み取り、`rstrip("\n")` で末尾の改行を除去します。その後 `read()` で残りの全文を読み込みます。
 
 `encoding="utf-8"` を明示することで、日本語などのマルチバイト文字が正しく読み込まれます。
+
+`newline="\n"` も明示しています。これを指定しないと、OSによって改行の変換方法が変わります（詳しくは 5.9 の「改行コードの正規化」を参照）。
 
 `OSError`（ファイル読み込み失敗）や `UnicodeError`（文字コードの問題）が発生した場合は、404エラーを返します。これにより、内部エラーの詳細が外部に漏洩するのを防ぎます。
 
@@ -1098,6 +1113,7 @@ if not verify_csrf_token(csrf_token):
 
 ```python
 content = request.form.get("content", "")
+content = content.replace("\r\n", "\n").replace("\r", "\n")
 language = sanitize_language(
     request.form.get("language", "text")
 )
@@ -1112,9 +1128,27 @@ if not content:
     ), 400
 ```
 
-内容が空の場合はエラーメッセージを表示し、フォームを再表示します。`flash()` を使うことで、次のページ表示時にメッセージが表示されます。
+内容が空の場合はエラーメッセージを登録し、フォームを再表示します。`flash()` で登録したメッセージは、テンプレート側の `get_flashed_messages()` で取り出して表示します（6.1 参照）。一度表示したメッセージは、自動的に消えます。
 
 HTTPステータスコード400を返すことで、これがクライアント側のエラー（入力漏れ）であることを明示します。
+
+---
+
+#### 改行コードの正規化
+
+```python
+content = request.form.get("content", "")
+content = content.replace("\r\n", "\n").replace("\r", "\n")
+```
+
+ブラウザは、`<textarea>` の改行を `\r\n`（CRLF）に変換して送信します。このまま保存すると、次の問題が起こります。
+
+* `/raw/<Paste ID>` の出力に `\r\n` がそのまま含まれる
+* Windowsでは、Pythonのテキストモードが書き込み時に `\n` を `\r\n` に変換するため、`\r\n` が `\r\r\n` として保存される。読み込み時には `\r\r\n` が改行2つに解釈され、空行が2倍になる
+
+そこで、受信した時点で改行を `\n` に統一します。あわせて、ファイルを開くときに `newline="\n"` を指定し、OSごとの変換を無効にします。これで、どのOSでも保存される内容は同じになります。
+
+この変換は文字数を減らすだけなので、サイズチェック（バイト数の計算）の前に行って問題ありません。
 
 ---
 
@@ -1355,11 +1389,36 @@ def not_found(error):
     {% endif %}
 </head>
 <body>
+    {% with messages = get_flashed_messages(with_categories=true) %}
+        {% if messages %}
+            <div class="messages">
+                {% for category, message in messages %}
+                    <div class="message {{ category }}">{{ message }}</div>
+                {% endfor %}
+            </div>
+        {% endif %}
+    {% endwith %}
 ```
 
 `{{ url_for('static', filename='style.css') }}` は、Flaskが自動的に `static/style.css` のURLを生成します。
 
 `{% if highlight_css %}` で、ハイライト用のCSSが存在する場合のみ `<style>` タグを出力します。Paste表示時のみCSSが必要で、フォーム表示時は不要なためです。
+
+---
+
+#### エラーメッセージの表示
+
+`<body>` の直後に、`flash()` で登録されたメッセージを表示する部分があります。
+
+```html
+{% with messages = get_flashed_messages(with_categories=true) %}
+```
+
+`get_flashed_messages(with_categories=true)` は、登録されたメッセージを `(カテゴリ, メッセージ)` の組のリストで返します。`flash("...", "error")` の第2引数がカテゴリで、ここでは `error` です。
+
+この表示部分がないと、`flash()` を呼んでもメッセージは画面に出ません。
+
+メッセージの `{{ message }}` には `|safe` を付けていないので、自動エスケープが働きます。
 
 ---
 
@@ -1551,6 +1610,26 @@ def not_found(error):
 
 これにより、スマートフォンなどの小さい画面でも操作しやすくなります。
 
+### 7.3 メッセージ表示
+
+```css
+.message {
+    padding: 10px 14px;
+    margin-bottom: 16px;
+    border: 1px solid #ccc;
+    border-radius: 6px;
+    background: #f5f5f5;
+}
+
+.message.error {
+    border-color: #d9534f;
+    background: #fdecea;
+    color: #8a1f1b;
+}
+```
+
+`flash(..., "error")` のカテゴリ名が `class="message error"` になるので、CSSでカテゴリごとに見た目を切り替えられます。
+
 ---
 
 ## 8. セキュリティ対策のまとめ
@@ -1590,7 +1669,7 @@ session["csrf_token"] = csrf_token
 secrets.compare_digest(token, expected)
 ```
 
-セッションに紐づいた秘密トークンを使い、別サイトからの偽造リクエストを防ぎます。
+セッションに紐づいた秘密トークンを使い、別サイトからの偽造リクエストを防ぎます。ただし、ログイン機能のないこのアプリでの実質的な効果は限定的です（5.6 参照）。
 
 #### DoS対策
 
