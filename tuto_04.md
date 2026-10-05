@@ -416,6 +416,15 @@ def sanitize_language(language):
 
 
 # ============================================================
+# Constant-time comparison
+# ============================================================
+
+def constant_time_equals(a, b):
+    """Compare two strings in constant time. Safe for non-ASCII input."""
+    return secrets.compare_digest(a.encode("utf-8"), b.encode("utf-8"))
+
+
+# ============================================================
 # CSRF
 # ============================================================
 
@@ -431,7 +440,7 @@ def verify_csrf_token(token):
     expected = session.get("csrf_token")
     if not token or not expected:
         return False
-    return secrets.compare_digest(token, expected)
+    return constant_time_equals(token, expected)
 
 
 # ============================================================
@@ -449,7 +458,7 @@ def generate_delete_token():
 def verify_delete_token(token, stored_hash):
     if not token or not stored_hash:
         return False
-    return secrets.compare_digest(
+    return constant_time_equals(
         hash_delete_token(token),
         stored_hash,
     )
@@ -486,6 +495,23 @@ def get_paste_from_db(paste_id):
         "SELECT * FROM pastes WHERE paste_id = ?",
         (paste_id,),
     ).fetchone()
+    return row
+
+
+def get_active_paste(paste_id):
+    """
+    Return the DB row of a paste that may be shown, or None.
+    None means: invalid ID, no such paste, or the paste has expired.
+
+    Every route that reads a paste must call this first.
+    """
+    if not is_valid_paste_id(paste_id):
+        return None
+
+    row = get_paste_from_db(paste_id)
+    if not row or is_expired(row["expires_at"]):
+        return None
+
     return row
 
 
@@ -636,7 +662,7 @@ def verify_api_key():
     provided = request.headers.get("X-API-Key", "")
     if not provided:
         return False
-    return secrets.compare_digest(provided, API_KEY)
+    return constant_time_equals(provided, API_KEY)
 
 
 # ============================================================
@@ -795,14 +821,8 @@ def index():
 
 @app.route("/paste/<paste_id>")
 def view_paste(paste_id):
-    if not is_valid_paste_id(paste_id):
-        return error_response("Paste not found.", 404)
-
-    row = get_paste_from_db(paste_id)
+    row = get_active_paste(paste_id)
     if not row:
-        return error_response("Paste not found.", 404)
-
-    if is_expired(row["expires_at"]):
         return error_response("Paste not found.", 404)
 
     # Atomically increment and get the updated view count
@@ -852,10 +872,7 @@ def view_paste(paste_id):
 
 @app.route("/raw/<paste_id>")
 def raw_paste(paste_id):
-    if not is_valid_paste_id(paste_id):
-        return error_response("Paste not found.", 404)
-
-    row = get_paste_from_db(paste_id)
+    row = get_active_paste(paste_id)
     if not row:
         return error_response("Paste not found.", 404)
 
@@ -969,11 +986,8 @@ def api_create_paste():
 
 @app.route("/api/pastes/<paste_id>", methods=["GET"])
 def api_get_paste(paste_id):
-    if not is_valid_paste_id(paste_id):
-        return api_error("Paste not found.", 404)
-
-    row = get_paste_from_db(paste_id)
-    if not row or is_expired(row["expires_at"]):
+    row = get_active_paste(paste_id)
+    if not row:
         return api_error("Paste not found.", 404)
 
     view_count = increment_view_count(paste_id)
@@ -1167,7 +1181,7 @@ SHA-256ハッシュ化
 データベースのハッシュ値と compare_digest で比較
 ```
 
-`secrets.compare_digest()` を使用することで、タイミング攻撃を防ぎます。
+`secrets.compare_digest()` を使用することで、タイミング攻撃を防ぎます。比較は `constant_time_equals()`（7.14 参照）を通して行います。
 
 #### SHA-256ハッシュ化の安全性について
 
@@ -1483,6 +1497,65 @@ Flaskのセッションは**署名はされるが暗号化はされません**�
 {% endif %}
 ```
 
+### 7.13 閲覧できるPasteの判定を1か所にまとめる
+
+```python
+def get_active_paste(paste_id):
+    """
+    Return the DB row of a paste that may be shown, or None.
+    None means: invalid ID, no such paste, or the paste has expired.
+    """
+    if not is_valid_paste_id(paste_id):
+        return None
+
+    row = get_paste_from_db(paste_id)
+    if not row or is_expired(row["expires_at"]):
+        return None
+
+    return row
+```
+
+`/paste/<paste_id>`、`/raw/<paste_id>`、`GET /api/pastes/<paste_id>` は、すべてこの関数で「見せてよいPasteか」を判定します。
+
+#### なぜ1か所にまとめるのか
+
+以前は、ID検証・DB検索・有効期限チェックを各ルートに個別に書いていました。その結果、`/raw/<paste_id>` だけ有効期限のチェックが抜け、期限切れのPasteが（クリーンアップが走るまで）読め、閲覧数も増えていました。
+
+同じチェックを3か所に書くと、1か所書き忘れても、動作確認では気づきにくくなります。判定を1つの関数にまとめ、新しいルートを足すときもこの関数を呼ぶ、というルールにします。
+
+#### ID検証との関係
+
+`get_paste_file_path()` は、ファイルパスを組み立てるだけで、IDの検証はしません。パストラバーサルを防ぐ `is_valid_paste_id()` は、`get_active_paste()` の中で実行されます。
+
+そのため、**ファイルを読むルートは、必ず先に `get_active_paste()` を呼ぶ**ことが、セキュリティ上も重要です。
+
+#### 削除では使わない
+
+`POST /delete/<paste_id>` と `DELETE /api/pastes/<paste_id>` は、この関数を使いません。期限切れでも、削除トークンを持つ人はクリーンアップ前に削除できるようにするため、ID検証とDB検索を個別に行います。
+
+### 7.14 文字列の比較（constant_time_equals）
+
+```python
+def constant_time_equals(a, b):
+    """Compare two strings in constant time. Safe for non-ASCII input."""
+    return secrets.compare_digest(a.encode("utf-8"), b.encode("utf-8"))
+```
+
+CSRFトークン、APIキー、削除トークンのハッシュの比較は、すべてこの関数を通します。
+
+#### なぜ文字列のまま比較しないのか
+
+`secrets.compare_digest()` に `str` を渡す場合、ASCII文字だけで構成されていないと `TypeError` になります。
+
+```python
+>>> secrets.compare_digest("あ", "abc")
+TypeError: comparing strings with non-ASCII characters is not supported
+```
+
+CSRFトークン（フォームの値）やAPIキー（`X-API-Key` ヘッダー）は、利用者が自由に内容を決めて送れる値です。非ASCII文字を送られると、例外が発生して500エラーになります。これは認証なしで起こせます。
+
+両辺をUTF-8のバイト列にしてから渡すと、どんな内容でも比較でき、タイミング攻撃への対策もそのまま保たれます。
+
 ---
 
 ## 8. クリーンアップスクリプト（cleanup.py）
@@ -1493,11 +1566,17 @@ Flaskのセッションは**署名はされるが暗号化はされません**�
 import logging
 import os
 import sqlite3
+import time
 from datetime import datetime, timezone
 
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
 PASTE_DIR = os.path.join(BASE_DIR, "pastes")
 DATABASE_PATH = os.path.join(BASE_DIR, "pastes.db")
+
+# Files younger than this are never treated as orphans.
+# A paste being created has its DB row committed first and its file written
+# right after, so a very new file may belong to a row we have not seen yet.
+ORPHAN_MIN_AGE_SECONDS = 600
 
 logging.basicConfig(
     level=logging.INFO,
@@ -1566,27 +1645,54 @@ def cleanup_orphan_files():
     """
     Remove files in pastes/ that have no corresponding DB record.
     This handles orphan files left by failed deletions or crashes.
+
+    Race with paste creation: the app commits the DB row first and writes
+    the file right after. A file that appeared after our DB snapshot looks
+    like an orphan, but is not. Two guards prevent deleting it:
+      1. Skip files younger than ORPHAN_MIN_AGE_SECONDS.
+      2. Ask the DB again right before deleting each candidate.
     """
     conn = sqlite3.connect(DATABASE_PATH)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout=5000")
 
-    rows = conn.execute("SELECT paste_id FROM pastes").fetchall()
-    valid_ids = {row["paste_id"] for row in rows}
-    conn.close()
-
     removed = 0
-    for filename in os.listdir(PASTE_DIR):
-        file_path = os.path.join(PASTE_DIR, filename)
-        if not os.path.isfile(file_path):
-            continue
-        if filename not in valid_ids:
+    try:
+        rows = conn.execute("SELECT paste_id FROM pastes").fetchall()
+        valid_ids = {row["paste_id"] for row in rows}
+        now = time.time()
+
+        for filename in os.listdir(PASTE_DIR):
+            file_path = os.path.join(PASTE_DIR, filename)
+            if not os.path.isfile(file_path):
+                continue
+            if filename in valid_ids:
+                continue
+
+            # Guard 1: too new to judge
+            try:
+                age = now - os.path.getmtime(file_path)
+            except OSError:
+                continue
+            if age < ORPHAN_MIN_AGE_SECONDS:
+                logging.info("Skipping recent file: %s", filename)
+                continue
+
+            # Guard 2: re-check the DB right before deleting
+            exists = conn.execute(
+                "SELECT 1 FROM pastes WHERE paste_id = ?", (filename,)
+            ).fetchone()
+            if exists:
+                continue
+
             try:
                 os.remove(file_path)
                 removed += 1
                 logging.info("Removed orphan file: %s", filename)
             except OSError as e:
                 logging.warning("Failed to remove orphan file %s: %s", filename, e)
+    finally:
+        conn.close()
 
     logging.info("Orphan cleanup completed. Removed %d orphan files.", removed)
 
@@ -1625,6 +1731,27 @@ Flaskアプリケーション内にクリーンアップ処理を組み込む方
 | ファイル削除成功 → DB削除成功 → commit失敗 | ファイルがないがDBレコードが残る → 不整合 |
 
 これらの不整合は、DBとファイルを分離しているアーキテクチャでは避けられません。`cleanup_orphan_files()` 関を定期的に実行することで、孤立ファイルを検出・削除できます。
+
+#### 孤立ファイルの削除とPaste作成の競合
+
+`cleanup_orphan_files()` は、「DBにレコードがないファイル」を孤立ファイルとして削除します。ところが、Paste作成は「DBのCOMMIT → ファイル書き込み」の順に行うため、次の流れで**作成直後の正常なPasteが消える**ことがあります。
+
+```
+クリーンアップ: DBからID一覧を取得（スナップショット）
+アプリ        : 新しいPasteをCOMMIT → ファイルを書き込む
+クリーンアップ: ディレクトリを走査 → 新しいファイルがID一覧にない → 孤立と判断して削除
+```
+
+結果は「DBにレコードがあるが、ファイルがない」状態で、Pasteの本文が失われます。ファイル数が多いほど、走査に時間がかかり、この窓は広がります。
+
+そこで、2つの対策を入れています。
+
+| 対策 | 内容 |
+|------|------|
+| 作成から10分未満のファイルは対象外 | 作成中のPasteは、DBのCOMMITの直後にファイルが書かれるので、新しいファイルは判断しない（`ORPHAN_MIN_AGE_SECONDS`） |
+| 削除の直前にDBへ再確認 | スナップショットの後に登録されたPasteを、念のため除外する |
+
+本当の孤立ファイルは、次回以降の実行（10分以上後）で削除されるだけなので、困りません。
 
 ### 8.3 cleanup.py の busy_timeout
 
@@ -2262,7 +2389,7 @@ API GET も閲覧数をインクリメントします。認証なしでアクセ
 | XSS | Pygmentsによる安全なHTML変換 |
 | セッション窃取 | `HttpOnly`, `SameSite`, `Secure` Cookie属性 |
 | 二重投稿 | PRGパターン |
-| タイミング攻撃 | `secrets.compare_digest()` |
+| タイミング攻撃 | `secrets.compare_digest()`（バイト列で比較。7.14 参照） |
 
 ### SQLite版で追加
 
@@ -2270,12 +2397,13 @@ API GET も閲覧数をインクリメントします。認証なしでアクセ
 |------|------|
 | 削除トークンの漏洩 | SHA-256ハッシュ化で保存（十分なエントロピーのトークンが前提） |
 | 不正なAPIアクセス | `X-API-Key` ヘッダー認証（作成・削除のみ） |
-| 期限切れPasteの閲覧 | 閲覧時の有効期限チェック |
+| 期限切れPasteの閲覧 | `get_active_paste()` による有効期限チェック（`/paste`・`/raw`・`/api` 共通） |
 | DBとファイルの不整合 | 補償処理とログ記録で不整合を減らす |
 | 情報漏洩 | エラー詳細隠蔽、一律404 |
 | 同時アクセス時の閲覧数 | `RETURNING` 句による原子性の確保 |
 | 無効なUnicode | `UnicodeEncodeError` の検証 |
 | 改行コードの不整合 | 保存前の `CRLF` → `LF` 正規化 |
+| 非ASCII文字による比較エラー | UTF-8のバイト列にしてから `compare_digest` で比較 |
 | SQLiteのロック競合 | WALモードと `busy_timeout` |
 
 ### 未対策の項目（別途検討が必要）
@@ -2296,35 +2424,68 @@ API GET も閲覧数をインクリメントします。認証なしでアクセ
 ファイルベース版からSQLite版へ移行する場合、以下の変換が必要です。
 
 * 旧ファイル形式（1行目に言語情報、その後に本文）から、言語情報をDBに移行
-* 本文だけを新しいファイル形式で保存
-* 作成日時はファイルのmtimeを参考にするが、正確な日時ではないことを理解する
+* 本文だけの新しいファイル形式に変換
+* 作成日時は、元ファイルのmtimeを参考にする（正確な日時ではないことを理解する）
+
+移行スクリプトは、**元のファイルを一切書き換えません**。新形式のファイルは別のディレクトリ `pastes_new/` に書き出し、全件の変換が終わってからディレクトリを入れ替えます。
+
+```text
+移行前                     変換後（入れ替え前）            入れ替え後
+
+pastes/      旧形式        pastes/      旧形式（無傷）      pastes/      新形式
+                           pastes_new/  新形式              pastes_old/  旧形式（バックアップ）
+```
 
 ### 14.2 移行スクリプト
 
 ```python
 #!/usr/bin/env python3
 """
-Migrate pastes from file-based format to SQLite-based format.
+Migrate pastes from the file-based format to the SQLite-based format.
 
-Old file format:
-    Line 1: language name
-    Line 2+: paste content
+Old format (pastes/<id>):  line 1 = language, line 2+ = content
+New format (pastes/<id>):  content only (the language lives in the DB)
 
-New file format:
-    Paste content only (language is stored in DB)
+The original files are NEVER modified. New-format files are written to
+pastes_new/, and the directories are swapped only after every file has
+been converted:
 
-This script is idempotent: running it multiple times is safe.
+    pastes/      -> pastes_old/   (the originals, kept as a backup)
+    pastes_new/  -> pastes/
+
+Before running: stop the application.
+After a crash or an error you can simply run this script again.
 """
 
 import os
+import re
+import shutil
 import sqlite3
+import sys
 from datetime import datetime, timezone
 
 from pygments.lexers import get_all_lexers
 
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
 PASTE_DIR = os.path.join(BASE_DIR, "pastes")
+NEW_DIR = os.path.join(BASE_DIR, "pastes_new")
+OLD_DIR = os.path.join(BASE_DIR, "pastes_old")
 DB_PATH = os.path.join(BASE_DIR, "pastes.db")
+DONE_MARKER = os.path.join(OLD_DIR, ".migrated")
+
+VALID_PASTE_ID = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
+
+SCHEMA = """
+    CREATE TABLE IF NOT EXISTS pastes (
+        paste_id         TEXT PRIMARY KEY,
+        language         TEXT NOT NULL DEFAULT 'text',
+        created_at       TEXT NOT NULL,
+        expires_at       TEXT,
+        view_count       INTEGER NOT NULL DEFAULT 0,
+        delete_token_hash TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_expires_at ON pastes(expires_at);
+"""
 
 # Rebuild allowed language set (same logic as app.py)
 ALLOWED_LANGUAGES = set()
@@ -2342,81 +2503,151 @@ def sanitize_language(language):
     return "text"
 
 
-def migrate():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA busy_timeout=5000")
-
-    # Ensure table exists
-    conn.executescript("""
-        CREATE TABLE IF NOT EXISTS pastes (
-            paste_id         TEXT PRIMARY KEY,
-            language         TEXT NOT NULL DEFAULT 'text',
-            created_at       TEXT NOT NULL,
-            expires_at       TEXT,
-            view_count       INTEGER NOT NULL DEFAULT 0,
-            delete_token_hash TEXT
-        );
-        CREATE INDEX IF NOT EXISTS idx_expires_at ON pastes(expires_at);
-    """)
-
-    for filename in os.listdir(PASTE_DIR):
-        filepath = os.path.join(PASTE_DIR, filename)
-        if not os.path.isfile(filepath):
+def list_old_pastes(directory):
+    """Yield (paste_id, path) for files that look like pastes, in a stable order."""
+    for name in sorted(os.listdir(directory)):
+        path = os.path.join(directory, name)
+        if not os.path.isfile(path):
             continue
-
-        # Skip already-migrated pastes (already in DB)
-        existing = conn.execute(
-            "SELECT 1 FROM pastes WHERE paste_id = ?", (filename,)
-        ).fetchone()
-        if existing:
-            print(f"Skipping already migrated: {filename}")
+        if not VALID_PASTE_ID.fullmatch(name):
+            print(f"Skipping (not a paste ID): {name}")
             continue
+        yield name, path
 
-        # Capture mtime BEFORE any modification
-        mtime = os.path.getmtime(filepath)
-        created_at = datetime.fromtimestamp(
-            mtime, tz=timezone.utc
-        ).isoformat()
 
-        # Read old format
-        with open(filepath, "r", encoding="utf-8") as f:
-            lines = f.readlines()
+def read_old_paste(path):
+    """
+    Read an old-format file.
+    Returns (language, content, created_at), or None for an empty file.
+    """
+    # The originals are never modified, so mtime is still the pre-migration value.
+    mtime = os.path.getmtime(path)
+    created_at = datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat()
 
-        if not lines:
-            continue
+    with open(path, "r", encoding="utf-8") as f:
+        lines = f.readlines()
 
-        # Validate language before inserting into DB
-        language = sanitize_language(lines[0].strip())
-        content = "".join(lines[1:])
+    if not lines:
+        return None
 
-        # Write new format atomically using temp file + replace
-        temp_path = filepath + ".tmp"
+    language = sanitize_language(lines[0].strip())
+    content = "".join(lines[1:])
+    return language, content, created_at
+
+
+def convert_to_new_dir():
+    """Step 1: write new-format files to pastes_new/. The originals are untouched."""
+    if os.path.exists(NEW_DIR):
+        shutil.rmtree(NEW_DIR)  # leftovers of an interrupted run; rebuilt from scratch
+    os.makedirs(NEW_DIR)
+
+    converted = 0
+    for paste_id, path in list_old_pastes(PASTE_DIR):
         try:
-            with open(temp_path, "w", encoding="utf-8", newline="") as f:
-                f.write(content)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(temp_path, filepath)
-        except OSError as e:
-            print(f"Failed to rewrite {filename}: {e}")
-            if os.path.exists(temp_path):
-                os.remove(temp_path)
+            parsed = read_old_paste(path)
+        except (OSError, UnicodeError) as e:
+            print(f"Skipping unreadable file {paste_id}: {e}")
             continue
 
-        # Insert into DB
-        conn.execute(
-            """
-            INSERT INTO pastes (paste_id, language, created_at, expires_at, view_count, delete_token_hash)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (filename, language, created_at, None, 0, None),
-        )
-        print(f"Migrated: {filename} (language={language})")
+        if parsed is None:
+            print(f"Skipping empty file: {paste_id}")
+            continue
 
-    conn.commit()
-    conn.close()
-    print("Migration completed.")
+        _, content, _ = parsed
+        with open(os.path.join(NEW_DIR, paste_id), "x", encoding="utf-8", newline="") as f:
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+        converted += 1
+
+    return converted
+
+
+def swap_directories():
+    """Step 2: pastes/ -> pastes_old/, then pastes_new/ -> pastes/."""
+    os.rename(PASTE_DIR, OLD_DIR)
+    os.rename(NEW_DIR, PASTE_DIR)
+
+
+def register_in_db(source_dir):
+    """
+    Step 3: insert the metadata, read from the ORIGINAL files in source_dir.
+    All rows are inserted in one transaction. INSERT OR IGNORE makes it re-runnable.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("PRAGMA busy_timeout=5000")
+    registered = 0
+    try:
+        conn.executescript(SCHEMA)
+        for paste_id, path in list_old_pastes(source_dir):
+            try:
+                parsed = read_old_paste(path)
+            except (OSError, UnicodeError):
+                continue  # already reported in step 1
+            if parsed is None:
+                continue
+
+            language, _, created_at = parsed
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO pastes (paste_id, language, created_at) "
+                "VALUES (?, ?, ?)",
+                (paste_id, language, created_at),
+            )
+            registered += cur.rowcount
+        conn.commit()
+    finally:
+        conn.close()
+
+    return registered
+
+
+def db_has_pastes():
+    if not os.path.exists(DB_PATH):
+        return False
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        has_table = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'pastes'"
+        ).fetchone()
+        if not has_table:
+            return False
+        return conn.execute("SELECT 1 FROM pastes LIMIT 1").fetchone() is not None
+    finally:
+        conn.close()
+
+
+def migrate():
+    if os.path.isdir(OLD_DIR):
+        # A previous run got past step 1. Never convert again.
+        if os.path.exists(DONE_MARKER):
+            print("Already migrated. Nothing to do.")
+            return
+
+        if not os.path.isdir(PASTE_DIR) and os.path.isdir(NEW_DIR):
+            print("Resuming: finishing the directory swap.")
+            os.rename(NEW_DIR, PASTE_DIR)
+
+        print("Resuming: registering metadata.")
+    else:
+        if not os.path.isdir(PASTE_DIR):
+            print("pastes/ not found. Nothing to migrate.")
+            return
+
+        if db_has_pastes():
+            print(
+                "pastes.db already contains pastes, so old-format and new-format "
+                "files cannot be told apart. Aborting without changes."
+            )
+            sys.exit(1)
+
+        converted = convert_to_new_dir()
+        print(f"Converted {converted} files to pastes_new/.")
+        swap_directories()
+        print("Swapped: pastes/ -> pastes_old/, pastes_new/ -> pastes/.")
+
+    registered = register_in_db(OLD_DIR)
+    open(DONE_MARKER, "w").close()
+    print(f"Registered {registered} pastes in the database. Migration completed.")
 
 
 if __name__ == "__main__":
@@ -2425,13 +2656,58 @@ if __name__ == "__main__":
 
 ### 14.3 移行スクリプトの設計上の注意点
 
+#### 実行前の準備
+
+* **アプリケーションを停止する** — 移行中に新しいPasteが作られないようにするためです
+* `pastes/` と `pastes.db` をバックアップしておく — 元ファイルは変更されませんが、念のためです
+* **初回の実行前に、`pastes.db` にPasteが入っていないこと** — SQLite版のアプリを先に使い始めていると、`pastes/` に新旧の形式が混在し、見分けられません。この場合、スクリプトは何も変更せずに中止します
+
+#### 処理の流れ
+
+| 手順 | 内容 | 途中で失敗した場合 |
+|------|------|--------------------|
+| 1. 変換 | `pastes/` の旧形式ファイルを読み、本文だけを `pastes_new/` に書く | 元ファイルは無傷。次回、`pastes_new/` を作り直す |
+| 2. 入れ替え | `pastes/` → `pastes_old/`、`pastes_new/` → `pastes/` | 2つの名前変更の間で止まっても、次回、残りを完了する |
+| 3. DB登録 | `pastes_old/` の元ファイルから言語・作成日時を読み、1つのトランザクションでINSERT | 全体が巻き戻る。次回、登録だけをやり直す |
+| 4. 完了印 | `pastes_old/.migrated` を作る | 次回、登録を再実行してから印を作る（`INSERT OR IGNORE` なので重複しない） |
+
+#### なぜ元ファイルを書き換えないのか
+
+このスクリプトの前の版は、ファイルをその場で書き換え、DBへの登録は最後にまとめてコミットしていました。この方式には、次の問題がありました。
+
+1. 途中で例外が起きる（例：UTF-8として読めないファイルがある）
+2. 書き換え済みのファイルは新形式のまま残り、DBへの登録は巻き戻る
+3. 再実行すると、新形式のファイルを旧形式として扱い、**本文の1行目を言語名として削除してしまう**
+
+「ファイルの書き換え」と「DBへの登録」は、1つの操作にまとめられません。どちらを先にしても、途中で止まれば中途半端な状態が残ります。
+
+元ファイルを残したまま、別の場所に新しいファイルを作る方式なら、どの時点で止まっても、元ファイルから何度でもやり直せます。
+
 #### べき等性（Idempotency）
 
-移行スクリプトは何度実行しても安全です。DBに既に存在するPaste IDはスキップされます。
+再実行したとき、スクリプトは次のように状態を判定します。
 
-#### mtimeの取得順序
+| 状態 | スクリプトの動作 |
+|------|------------------|
+| `pastes_old/.migrated` がある | 「移行済み」として何もしない。移行後にアプリで削除したPasteが復活しない |
+| `pastes_old/` があるが、完了印がない | 入れ替えが未完了なら完了させ、DB登録だけを行う。変換は二度と行わない |
+| `pastes_old/` がない | 初回として扱う。DBが空であることを確認してから変換する |
 
-ファイルの `mtime` は**ファイル書き換えの前**に取得します。書き換え後に取得すると、移行実行時刻になってしまいます。
+#### 読めないファイルの扱い
+
+UTF-8として読めないファイルや、空のファイルは、スキップして画面に表示します。全体は止まりません。スキップされたファイルは `pastes_old/` に残るので、あとから内容を確認して手動で対処できます。
+
+`.tmp` など、Paste IDの形式（`[a-zA-Z0-9_-]{1,64}`）に合わない名前のファイルも、スキップされます。
+
+#### 元に戻すには
+
+アプリケーションを停止して、ディレクトリを元の名前に戻し、DBを削除します。
+
+```bash
+mv pastes pastes_failed
+mv pastes_old pastes
+rm -f pastes.db pastes.db-wal pastes.db-shm
+```
 
 #### 言語の検証
 
@@ -2455,13 +2731,11 @@ def sanitize_language(language):
 
 旧ファイルの1行目の言語名をそのままDBに挿入するのではなく、`sanitize_language()` で検証します。無効な言語名は `"text"` にフォールバックされます。これにより、DBに無効な言語名が残ることを防ぎます。
 
-#### アトミックなファイル書き込み
-
-一時ファイルに書き込んでから `os.replace()` で置き換えることで、書き込み途中のファイルが残るリスクを減らします。`os.replace()` はOSレベルでアトミック（不可分）に実行されます。
-
 #### 作成日時の限界
 
 `os.path.getmtime()` は正確な作成日時ではありません。ファイルのコピー操作等でも値が変わる可能性があります。正確な作成日時を記録するには、ファイルベース版の段階で作成日時を別途記録しておく必要があります。
+
+なお、元ファイルは書き換えないので、移行前のmtimeがそのまま使われます。
 
 ---
 
