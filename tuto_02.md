@@ -294,8 +294,8 @@ def verify_csrf_token(token):
         return False
 
     return secrets.compare_digest(
-        token,
-        expected,
+        token.encode("utf-8"),
+        expected.encode("utf-8"),
     )
 
 
@@ -931,8 +931,8 @@ def verify_csrf_token(token):
         return False
 
     return secrets.compare_digest(
-        token,
-        expected,
+        token.encode("utf-8"),
+        expected.encode("utf-8"),
     )
 ```
 
@@ -941,6 +941,8 @@ def verify_csrf_token(token):
 `secrets.compare_digest()` を使用する理由は、**タイミング攻撃**を防ぐためです。通常の文字列比較（`==`）は、先頭から1文字ずつ比較し、不一致が見つかった時点で終了します。攻撃者はこの比較時間の差を測定することで、正しいトークンを推測できる可能性があります。
 
 `secrets.compare_digest()` は常に一定時間で比較を行い、この攻撃を防ぎます。
+
+なお、`compare_digest()` に `str` を渡す場合は、ASCII文字だけで構成されていないと `TypeError` になります。CSRFトークンはフォームから送られる値で、利用者が自由に内容を変えられるため、`あ` のような文字を送られると500エラーになってしまいます。そこで、両方を `.encode("utf-8")` でバイト列にしてから比較します。
 
 ### 5.7 Paste IDの生成
 
@@ -1666,7 +1668,7 @@ csrf_token = secrets.token_urlsafe(32)
 session["csrf_token"] = csrf_token
 
 # 送信時に検証
-secrets.compare_digest(token, expected)
+secrets.compare_digest(token.encode("utf-8"), expected.encode("utf-8"))
 ```
 
 セッションに紐づいた秘密トークンを使い、別サイトからの偽造リクエストを防ぎます。ただし、ログイン機能のないこのアプリでの実質的な効果は限定的です（5.6 参照）。
