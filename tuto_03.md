@@ -1,14 +1,13 @@
-# Python + Flask + SQLiteで作るPastebin
+# Python + Flask + SQLiteで作るPastebin（完成版）
 
-このチュートリアルでは、PythonとFlask、SQLiteを使って、ファイルベースのPastebinを拡張し、より実用的なPastebinを作ります。
+このチュートリアルでは、PythonとFlask、SQLiteを使って、ファイルベースのPastebinを拡張し、より実用的なPastebinを完成させます。
 
 前章のファイルベース版では、データベースなしでシンプルに動作するPastebinを構築しました。この章では、SQLiteを導入することで以下の機能を追加します。
 
-* **有効期限** — Pasteに有効期限を設定し、期限切れを自動削除
+* **有効期限** — Pasteに有効期限を設定し、期限切れを削除
 * **閲覧数** — 各Pasteの閲覧回数をカウント
 * **削除機能** — 削除トークンを使ったPasteの削除
 * **API** — 外部からのプログラマティックなアクセス
-* **トランザクション的整合性** — データベースとファイルの整合性を保
 * **UTC基準の日時管理** — タイムゾーンによる混乱を排除
 
 ---
@@ -25,17 +24,19 @@
 | 閲覧数 | ファイルに書き込むたびにロックが必要で競合しやすい |
 | 削除トークン | ファイル内に保存すると表示時に露出する、別ファイルだと管理が複雑 |
 | 作成日時 | ファイルのctime/mtimeはOS依存があり信頼できない |
-| 一覧・検索 | ファイル名だけでは言語や日時で絞り込めない |
+| 一覧・検索 | ファイルだけでは言語や日時で絞り込めない |
 
 ### 1.2 SQLiteを使う理由
 
 SQLiteを導入することで、上記の問題を解決できます。
 
-* **構造問データの管理** — テーブル形式でメタデータを管理
-* **ACIDトランザクション** — 書き込みの原子性を保証
-* **同時アクセスの安全性** — SQLiteがロックを管理
-* **クエリによる検索** — SQLで柔軟な検索・絞り込みが可能
+* **構造化データの管理** — テーブル形式でメタデータを管理
+* **ACIDトランザクション** — SQLite内部の操作について原子性を保証
+* **同時アクセスの安全性** — SQLiteがDBファイルへのロックを管理
+* **クエによる検索** — SQLで柔軟な検索・絞り込みが可能
 * **軽量** — 別途サーバーを立てる必要がない、ファイルベースのデータベース
+
+ただし、SQLiteのトランザクションはSQLite自身の操作に対してのみ有効です。本文ファイルへの書き込みとSQLiteの操作を合わせた完全な原子性は保証されません。
 
 ### 1.3 なぜ本文はファイルに残すのか
 
@@ -43,7 +44,7 @@ SQLiteに本文も保存できますが、この構成では**メタデータの
 
 理由は以下の通りです。
 
-* **SQLiteのBLOBは大きなテキストに向かない** — 数百KB以上のテキストを大量に保存するとデータベースファイルが肥大化
+* **SQLiteのBLOBは大きなテキストに向かない** — 数KB以上のテキストを大量に保存するとデータベースファイルが肥大化
 * **ファイルの方がシンプル** — 本文の読み書きはファイルの方が高速でシンプル
 * **バックアップの分離** — メタデータと本文を別々にバックアップできる
 * **責務の分離** — SQLiteは「管理情報」、ファイルは「本文」という明確な分離
@@ -54,6 +55,28 @@ SQLiteに本文も保存できますが、この構成では**メタデータの
 |--------|----------|
 | SQLite (`pastes.db`) | Paste ID、言語、作成日時、有効期限、閲覧数、削除トークンハッシュ |
 | ファイル (`pastes/`) | Paste本文（純粋なテキスト） |
+
+### 1.4 DBとファイルの整合性について（重要）
+
+この構成では、SQLiteとファイルの両方を使います。**SQLiteのトランザクションはSQLiteの操作だけを対象にするため、DBとファイルを完全に原子的に扱うことはできません**。
+
+例えば、以下のような不整合が理論上は起こり得ます。
+
+| 状況 | 結果 |
+|------|------|
+| DBにINSERT成功 → ファイル書き込み失敗 → 補償削除成功 | DBにもファイルもない → 整合 |
+| DBにINSERT成功 → ファイル書き込み成功 | DBにもファイルもある → 整合 |
+| DBにINSERT成功 → COMMIT → ファイル書き込み直前にクラッシュ | DBにレコードがあるがファイルがない → 不整合 |
+| 削除時：DB削除成功 → ファイル削除失敗 | DBにないがファイルだけ残る（孤立ファイル）→ 不整合 |
+
+本チュートリアルでは、以下の方針で不整合をできるだけ減らします。
+
+* **作成時** — DBにINSERTしてCOMMIT **した後**にファイルを書き込む。ファイル書き込みが失敗したら、DBレコードを削除して補償する
+* **削除時** — DBレコードを先に削除し、ファイル削除の失敗はログに記録。孤立ファイルは後続のクリーンアップや手動で対応
+* **クリーンアップ時** — ファイル削除後にDBレコードを削除。DB削除前にクラッシュすると孤立ファイルが残る可能性がある
+* **閲覧時** — ファイルが存在しない場合は404を返す。DBレコードがあってもファイルがなければ正常にエラーを返せる
+
+この制約は「ファイルとDBを分離する」アーキテクチャの本質的な制約です。完全な整合性が必要な場合は、本文もSQLiteに保存するか、より高度な分散トランザクション機構を検討してください。
 
 ---
 
@@ -78,11 +101,10 @@ SQLiteに本文も保存できますが、この構成では**メタデータの
 ### SQLite版で追加される機能
 
 * **有効期限の設定** — 作成時に有効期限を指定可能
-* **閲覧数カウント** — 閲覧時に自動的にカウントアップ
+* **閲覧数カウント** — `/paste/`、`/raw/`、`/api/pastes/` のすべてのアクセスで自動的にカウント（仕様として統一）
 * **削除機能** — 削除トークンを使ったPaste削除
 * **作成日時の記録** — UTCで統一管理
-* **API** — HTTPヘッダー認証付きのREST風API
-* **トランザクション安全** — DB書き込みとファイル書き込みの原子性
+* **API** — HTTPヘッダー認証付きのREST風API（レートリミットは別途検討が必要）
 * **定期クリーンアップ** — 期限切れPasteの削除スクリプト
 
 ---
@@ -92,7 +114,7 @@ SQLiteに本文も保存できますが、この構成では**メタデータの
 ```text
 pastebin/
 ├── app.py              ← Flaskアプリケーション本体
-├── cleanup.py          ← 期限切れPasteの削除スクリプト
+├── cleanup.py          ← 期限切れPasteの削除クリプト
 ├── schema.sql          ← SQLiteのテーブル定義
 ├── requirements.txt    ← 必要なパッケージ
 ├── pastes.db           ← SQLiteデータベースファイル
@@ -114,7 +136,7 @@ pastebin/
 | `cleanup.py` | 期限切れPasteをDBとファイルから削除する独立スクリプト |
 | `schema.sql` | データベースのテーブル構造を定義 |
 | `pastes.db` | SQLiteデータベース（自動作成） |
-| `templates/view.html` | Paste表示専用テプレート（index.htmlから分離） |
+| `templates/view.html` | Paste表示専用テンプレート（index.htmlから分離） |
 
 ---
 
@@ -185,12 +207,14 @@ SQLiteには日時専用の型がありません。日時の保存方法には�
 
 #### なぜ削除トークンはハッシュ化するのか
 
-削除トークンは「そのトークンを知っている者のみがPasteを削除できる」という認証情報です。データベースに平文で保存すると、以下のリスクがあります。
+削除トークンは「そのトークンを知っている者のみがPasteを削除できる」という認証情報です。データベースに平で保存すると、以下のリスクがあります。
 
 * データベースファイルが漏洩した場合、すべてのPasteの削除トークンが流出
 * バックアップファイルから削除トークンが復元可能
 
-SHA-256でハッシュ化して保存することで、たとえデータベースが漏洩しても、元のトークンを逆算することは困難です。検証時には「受け取たトークンをハッシュ化して、保存されたハッシュと比較」します。
+SHA-256でハッシュ化して保存することで、たとえデータベースが漏洩しても、元のトークンを直接知ることは困難になります。ただし、SHA-256そのものが安全なのではなく、`secrets.token_urlsafe(16)` で生成された十分にランダムなトークンに対しては、総当たりによる逆算が現実的ではない、という点が重要です。もしトークンが短かったり、予測可能なパターン（連番など）だったりすると、SHA-256でも総当たりで元のトークンを見つけ出すことが可能です。
+
+検証時には「受け取ったトークンをハッシュ化して、保存されたハッシュと比較」します。
 
 #### インデックスの意味
 
@@ -198,19 +222,17 @@ SHA-256でハッシュ化して保存することで、たとえデータベー�
 CREATE INDEX IF NOT EXISTS idx_expires_at ON pastes(expires_at);
 ```
 
-`expires_at` カラムにインデックスを作成します。クリーンアップ時に「有効期限が現在時刻より古いレコード」を検索するため、このカラムへのインデックスがないと、Paste数が増えるにつれて検索が遅くなります。
+`expires_at` カラムにインデックスを作成します。クリンアップ時に「有効期限が現在時刻より古いレコード」を検索するため、このカラムへのインデックスがないと、Paste数が増えるにつれて検索が遅くなります。
 
 ### 5.2 データベースの初期化
 
 ```python
-import sqlite3
-
-DATABASE_PATH = "pastes.db"
-
 def init_db():
-    with sqlite3.connect(DATABASE_PATH) as conn:
-        with open("schema.sql", "r", encoding="utf-8") as f:
-            conn.executescript(f.read())
+    with app.app_context():
+        db = get_db()
+        with app.open_resource("schema.sql", mode="r") as f:
+            db.executescript(f.read())
+        db.commit()
 ```
 
 `executescript()` は複数のSQL文を一度に実行できます。`schema.sql` の `IF NOT EXISTS` により、何度実行しても既存のテーブルやインデックスは上書きされません。
@@ -238,6 +260,7 @@ from flask import (
     abort,
     flash,
     g,
+    jsonify,
     redirect,
     render_template,
     request,
@@ -421,18 +444,6 @@ def is_expired(expires_at):
 # Paste operations
 # ============================================================
 
-def create_paste_in_db(paste_id, language, expires_at, delete_token_hash):
-    db = get_db()
-    db.execute(
-        """
-        INSERT INTO pastes (paste_id, language, created_at, expires_at, delete_token_hash)
-        VALUES (?, ?, ?, ?, ?)
-        """,
-        (paste_id, language, utc_now_iso(), expires_at, delete_token_hash),
-    )
-    db.commit()
-
-
 def get_paste_from_db(paste_id):
     db = get_db()
     row = db.execute(
@@ -443,12 +454,17 @@ def get_paste_from_db(paste_id):
 
 
 def increment_view_count(paste_id):
+    """
+    Increment view count and return the updated value.
+    Uses RETURNING clause to get the new value atomically.
+    """
     db = get_db()
-    db.execute(
-        "UPDATE pastes SET view_count = view_count + 1 WHERE paste_id = ?",
+    row = db.execute(
+        "UPDATE pastes SET view_count = view_count + 1 WHERE paste_id = ? RETURNING view_count",
         (paste_id,),
-    )
+    ).fetchone()
     db.commit()
+    return row["view_count"] if row else 0
 
 
 def delete_paste_from_db(paste_id):
@@ -487,15 +503,27 @@ def remove_paste_file(paste_id):
     file_path = get_paste_file_path(paste_id)
     try:
         os.remove(file_path)
+        return True
     except OSError:
-        pass
+        return False
 
 
 # ============================================================
-# Transaction-safe paste creation
+# Paste creation with compensation on failure
 # ============================================================
 
 def create_paste(content, language, expires_at=None):
+    """
+    Create a paste with DB record and file.
+
+    Order: BEGIN -> INSERT -> COMMIT -> write file
+    If file write fails, compensate by deleting the DB record.
+
+    This minimizes the window where DB has a record but file does not.
+    The remaining risk is a crash between COMMIT and file write,
+    which leaves a DB record without a file. This is handled by
+    returning 404 when the file is missing on read.
+    """
     for _ in range(20):
         paste_id = shortuuid.random(length=10)
         if not is_valid_paste_id(paste_id):
@@ -508,7 +536,6 @@ def create_paste(content, language, expires_at=None):
         try:
             db.execute("BEGIN IMMEDIATE")
 
-            # Check if paste_id already exists
             existing = db.execute(
                 "SELECT 1 FROM pastes WHERE paste_id = ?",
                 (paste_id,),
@@ -526,14 +553,24 @@ def create_paste(content, language, expires_at=None):
                 (paste_id, language, utc_now_iso(), expires_at, delete_token_hash),
             )
 
-            write_paste_file(paste_id, content)
-
             db.commit()
+
+            # Write file AFTER commit to minimize inconsistent window
+            try:
+                write_paste_file(paste_id, content)
+            except OSError:
+                # Compensate: delete DB record since file write failed
+                try:
+                    db.execute("DELETE FROM pastes WHERE paste_id = ?", (paste_id,))
+                    db.commit()
+                except Exception:
+                    logging.exception("Failed to compensate DB deletion for paste %s", paste_id)
+                raise
+
             return paste_id, delete_token
 
         except Exception:
             db.rollback()
-            remove_paste_file(paste_id)
             raise
 
     raise RuntimeError("Unable to generate a unique paste ID.")
@@ -553,6 +590,66 @@ def verify_api_key():
 
 
 # ============================================================
+# Error response helpers
+# ============================================================
+
+def wants_json():
+    """Check if the client expects JSON response."""
+    accept = request.headers.get("Accept", "")
+    return request.is_json or accept.startswith("application/json")
+
+
+def error_response(message, status_code):
+    """Return JSON or HTML error response based on client preference."""
+    if wants_json():
+        return jsonify({"error": message}), status_code
+    # For browser requests, render HTML templates
+    if status_code == 404:
+        return render_template("404.html", message=message), status_code
+    if status_code == 413:
+        return render_template("413.html", max_bytes=MAX_PASTE_BYTES), status_code
+    if status_code == 400:
+        return render_template("404.html", message="Bad request."), status_code
+    if status_code == 401:
+        return render_template("404.html", message="Unauthorized."), status_code
+    if status_code == 403:
+        return render_template("404.html", message="Forbidden."), status_code
+    return render_template("404.html", message=message), status_code
+
+
+# ============================================================
+# Input validation helpers
+# ============================================================
+
+def validate_paste_content(content):
+    """Validate paste content. Returns (is_valid, error_message)."""
+    if not isinstance(content, str):
+        return False, "Content must be a string."
+    if not content:
+        return False, "Paste content is required."
+    content_bytes = content.encode("utf-8")
+    if len(content_bytes) > MAX_PASTE_BYTES:
+        return False, "Paste too large."
+    return True, None
+
+
+def validate_expires_minutes(expires_minutes):
+    """Validate expiration minutes. Returns (is_valid, expires_at, error_message)."""
+    if expires_minutes is None or expires_minutes == "":
+        return True, None, None
+    try:
+        minutes = int(expires_minutes)
+        if minutes <= 0:
+            return False, None, "Expiration must be a positive integer."
+        if minutes > 525600 * 10:  # Max 10 years
+            return False, None, "Expiration too far in the future."
+        expires_at = (datetime.now(timezone.utc) + timedelta(minutes=minutes)).isoformat()
+        return True, expires_at, None
+    except (ValueError, TypeError):
+        return False, None, "Expiration must be a valid integer."
+
+
+# ============================================================
 # Routes
 # ============================================================
 
@@ -561,38 +658,44 @@ def index():
     if request.method == "POST":
         csrf_token = request.form.get("csrf_token", "")
         if not verify_csrf_token(csrf_token):
+            if wants_json():
+                return error_response("Invalid CSRF token.", 400)
             abort(400)
 
         content = request.form.get("content", "")
         language = sanitize_language(request.form.get("language", "text"))
 
-        # Optional expiration
-        expires_minutes = request.form.get("expires_minutes", "")
-        expires_at = None
-        if expires_minutes:
-            try:
-                minutes = int(expires_minutes)
-                if minutes > 0:
-                    expires_at = (datetime.now(timezone.utc) + timedelta(minutes=minutes)).isoformat()
-            except ValueError:
-                pass
-
-        if not content:
-            flash("Paste content is required.", "error")
+        is_valid, error_msg = validate_paste_content(content)
+        if not is_valid:
+            if wants_json():
+                return error_response(error_msg, 400 if "required" in error_msg else 413)
+            if "too large" in error_msg:
+                abort(413)
+            flash(error_msg, "error")
             return render_template(
                 "index.html",
                 csrf_token=get_csrf_token(),
                 language_options=LANGUAGE_OPTIONS,
             ), 400
 
-        content_bytes = content.encode("utf-8")
-        if len(content_bytes) > MAX_PASTE_BYTES:
-            abort(413)
+        expires_minutes = request.form.get("expires_minutes", "")
+        is_valid, expires_at, error_msg = validate_expires_minutes(expires_minutes)
+        if not is_valid:
+            if wants_json():
+                return error_response(error_msg, 400)
+            flash(error_msg, "error")
+            return render_template(
+                "index.html",
+                csrf_token=get_csrf_token(),
+                language_options=LANGUAGE_OPTIONS,
+            ), 400
 
         try:
             paste_id, delete_token = create_paste(content, language, expires_at)
         except RuntimeError:
             logging.exception("Failed to create paste.")
+            if wants_json():
+                return error_response("Unable to create paste.", 500)
             flash("Unable to create paste.", "error")
             return render_template(
                 "index.html",
@@ -601,6 +704,8 @@ def index():
             ), 500
         except OSError:
             logging.exception("Failed to write paste.")
+            if wants_json():
+                return error_response("Unable to save paste.", 500)
             flash("Unable to save paste.", "error")
             return render_template(
                 "index.html",
@@ -610,8 +715,9 @@ def index():
 
         logging.info("Created paste: %s", paste_id)
 
-        # Show delete token once
-        flash(f"Paste created. Delete token: {delete_token}", "info")
+        # Store delete token temporarily in session with a paste-specific key.
+        # It is removed when displayed in view_paste.
+        session[f"_delete_token_{paste_id}"] = delete_token
 
         return redirect(url_for("view_paste", paste_id=paste_id))
 
@@ -625,16 +731,17 @@ def index():
 @app.route("/paste/<paste_id>")
 def view_paste(paste_id):
     if not is_valid_paste_id(paste_id):
-        abort(404)
+        return error_response("Paste not found.", 404)
 
     row = get_paste_from_db(paste_id)
     if not row:
-        abort(404)
+        return error_response("Paste not found.", 404)
 
     if is_expired(row["expires_at"]):
-        abort(404)
+        return error_response("Paste not found.", 404)
 
-    increment_view_count(paste_id)
+    # Atomically increment and get the updated view count
+    view_count = increment_view_count(paste_id)
 
     content = read_paste_file(paste_id)
     language = sanitize_language(row["language"])
@@ -659,27 +766,31 @@ def view_paste(paste_id):
             linenos=True, cssclass="highlight"
         ).get_style_defs(".highlight")
 
+    # Retrieve and remove the delete token from session if present
+    delete_token = session.pop(f"_delete_token_{paste_id}", None)
+
     return render_template(
         "view.html",
         paste_id=paste_id,
         paste_language=language,
         paste_content=highlighted,
         highlight_css=highlight_css,
-        view_count=row["view_count"] + 1,
+        view_count=view_count,
         created_at=row["created_at"],
         expires_at=row["expires_at"],
         csrf_token=get_csrf_token(),
+        delete_token=delete_token,
     )
 
 
 @app.route("/raw/<paste_id>")
 def raw_paste(paste_id):
     if not is_valid_paste_id(paste_id):
-        abort(404)
+        return error_response("Paste not found.", 404)
 
     row = get_paste_from_db(paste_id)
     if not row or is_expired(row["expires_at"]):
-        abort(404)
+        return error_response("Paste not found.", 404)
 
     increment_view_count(paste_id)
 
@@ -697,25 +808,39 @@ def raw_paste(paste_id):
 @app.route("/delete/<paste_id>", methods=["POST"])
 def delete_paste(paste_id):
     if not is_valid_paste_id(paste_id):
-        abort(404)
+        return error_response("Paste not found.", 404)
 
     csrf_token = request.form.get("csrf_token", "")
     if not verify_csrf_token(csrf_token):
+        if wants_json():
+            return error_response("Invalid CSRF token.", 400)
         abort(400)
 
     row = get_paste_from_db(paste_id)
     if not row:
-        abort(404)
+        return error_response("Paste not found.", 404)
 
     token = request.form.get("delete_token", "")
     if not verify_delete_token(token, row["delete_token_hash"]):
+        if wants_json():
+            return error_response("Invalid delete token.", 403)
         flash("Invalid delete token.", "error")
         return redirect(url_for("view_paste", paste_id=paste_id))
 
+    # Delete DB record first, then file.
+    # If file deletion fails, the DB is consistent and the orphan file
+    # can be cleaned up later.
     delete_paste_from_db(paste_id)
-    remove_paste_file(paste_id)
+    file_removed = remove_paste_file(paste_id)
+
+    if not file_removed:
+        logging.warning("Failed to remove paste file during deletion: %s", paste_id)
 
     logging.info("Deleted paste: %s", paste_id)
+
+    if wants_json():
+        return jsonify({"message": "Paste deleted."}), 200
+
     flash("Paste deleted.", "info")
     return redirect(url_for("index"))
 
@@ -727,37 +852,41 @@ def delete_paste(paste_id):
 @app.route("/api/pastes", methods=["POST"])
 def api_create_paste():
     if not verify_api_key():
-        abort(401)
+        return error_response("Unauthorized.", 401)
 
-    data = request.get_json(silent=True) or {}
-    content = data.get("content", "")
+    data = request.get_json(silent=True)
+    if data is None:
+        return error_response("Invalid JSON body.", 400)
+
+    # Validate content field exists and is correct type
+    if "content" not in data:
+        return error_response("Paste content is required.", 400)
+    content = data["content"]
+    if not isinstance(content, str):
+        return error_response("Content must be a string.", 400)
+
     language = sanitize_language(data.get("language", "text"))
 
+    # Validate content size
+    is_valid, error_msg = validate_paste_content(content)
+    if not is_valid:
+        status = 413 if "too large" in error_msg else 400
+        return error_response(error_msg, status)
+
+    # Validate expiration
     expires_minutes = data.get("expires_minutes")
-    expires_at = None
-    if expires_minutes:
-        try:
-            minutes = int(expires_minutes)
-            if minutes > 0:
-                expires_at = (datetime.now(timezone.utc) + timedelta(minutes=minutes)).isoformat()
-        except (ValueError, TypeError):
-            pass
-
-    if not content:
-        return {"error": "Paste content is required."}, 400
-
-    content_bytes = content.encode("utf-8")
-    if len(content_bytes) > MAX_PASTE_BYTES:
-        return {"error": "Paste too large."}, 413
+    is_valid, expires_at, error_msg = validate_expires_minutes(expires_minutes)
+    if not is_valid:
+        return error_response(error_msg, 400)
 
     try:
         paste_id, delete_token = create_paste(content, language, expires_at)
     except RuntimeError:
         logging.exception("Failed to create paste via API.")
-        return {"error": "Unable to create paste."}, 500
+        return error_response("Unable to create paste.", 500)
     except OSError:
         logging.exception("Failed to write paste via API.")
-        return {"error": "Unable to save paste."}, 500
+        return error_response("Unable to save paste.", 500)
 
     logging.info("Created paste via API: %s", paste_id)
 
@@ -771,53 +900,55 @@ def api_create_paste():
     if expires_at:
         response_data["expires_at"] = expires_at
 
-    return response_data, 201
+    return jsonify(response_data), 201
 
 
 @app.route("/api/pastes/<paste_id>", methods=["GET"])
 def api_get_paste(paste_id):
     if not is_valid_paste_id(paste_id):
-        abort(404)
+        return error_response("Paste not found.", 404)
 
     row = get_paste_from_db(paste_id)
     if not row or is_expired(row["expires_at"]):
-        abort(404)
+        return error_response("Paste not found.", 404)
 
-    increment_view_count(paste_id)
-
+    view_count = increment_view_count(paste_id)
     content = read_paste_file(paste_id)
 
-    return {
+    return jsonify({
         "paste_id": paste_id,
         "language": row["language"],
         "content": content,
-        "view_count": row["view_count"] + 1,
+        "view_count": view_count,
         "created_at": row["created_at"],
         "expires_at": row["expires_at"],
-    }, 200
+    }), 200
 
 
 @app.route("/api/pastes/<paste_id>", methods=["DELETE"])
 def api_delete_paste(paste_id):
     if not verify_api_key():
-        abort(401)
+        return error_response("Unauthorized.", 401)
 
     if not is_valid_paste_id(paste_id):
-        abort(404)
+        return error_response("Paste not found.", 404)
 
     row = get_paste_from_db(paste_id)
     if not row:
-        abort(404)
+        return error_response("Paste not found.", 404)
 
     token = request.headers.get("X-Delete-Token", "")
     if not verify_delete_token(token, row["delete_token_hash"]):
-        return {"error": "Invalid or missing delete token."}, 403
+        return error_response("Invalid or missing delete token.", 403)
 
     delete_paste_from_db(paste_id)
-    remove_paste_file(paste_id)
+    file_removed = remove_paste_file(paste_id)
+
+    if not file_removed:
+        logging.warning("Failed to remove paste file during API deletion: %s", paste_id)
 
     logging.info("Deleted paste via API: %s", paste_id)
-    return {"message": "Paste deleted."}, 200
+    return jsonify({"message": "Paste deleted."}), 200
 
 
 # ============================================================
@@ -826,22 +957,22 @@ def api_delete_paste(paste_id):
 
 @app.errorhandler(400)
 def bad_request(error):
-    return render_template("404.html", message="Bad request."), 400
+    return error_response("Bad request.", 400)
 
 
 @app.errorhandler(401)
 def unauthorized(error):
-    return render_template("404.html", message="Unauthorized."), 401
+    return error_response("Unauthorized.", 401)
 
 
 @app.errorhandler(404)
 def not_found(error):
-    return render_template("404.html", message="Paste not found."), 404
+    return error_response("Paste not found.", 404)
 
 
 @app.errorhandler(413)
 def request_too_large(error):
-    return render_template("413.html", max_bytes=MAX_PASTE_BYTES), 413
+    return error_response("Payload too large.", 413)
 
 
 # ============================================================
@@ -867,7 +998,7 @@ def get_db():
     return g.db
 ```
 
-Flaskの `g` オブジェクトは、**リクエスト単位**のグローバル名前空間です。同じリクエスト内で複数回 `get_db()` を呼んでも、新しい接続が作られるのは最初の1回だけです。
+Flaskの `g` オブジェクトは、**リクエスト単位**のローバル名前空間です。同じリクエスト内で複数回 `get_db()` を呼んでも、新しい接続が作られるのは最初の1回だけです。
 
 `sqlite3.Row` を `row_factory` に設定することで、結果を辞書のようにアクセスできます。
 
@@ -925,6 +1056,12 @@ SHA-256ハッシュ化
 
 `secrets.compare_digest()` を使用することで、タイミング攻撃を防ぎます。
 
+#### SHA-256ハッシュ化の安全性について
+
+SHA-256でハッシュ化すること自体が安全なのではなく、**`secrets.token_urlsafe(16)` で生成された十分にランダムなトークンに対しては、総当たりによる逆算が現実的ではない**、という点が重要です。
+
+もしトークンが短かったり、予測可能なパターン（連番など）だったりすると、SHA-256でも総当たりで元のトークンを見つけ出すことが可能です。十分なエントロピー（ランダム性）を持つトークンを使うことが前提となります。
+
 ### 7.3 UTC日時の統一管理
 
 ```python
@@ -936,19 +1073,61 @@ def utc_now_iso():
 
 #### なぜUTCを使うのか
 
-* サーバーが異なるタイムゾーン移動しても日時が変わらない
+* サーバーが異なるタイムゾーンに移動しても日時が変わらない
 * 夏時間（DST）の有無に関係なく一貫した動作
 * クライアントのタイムゾーンと独立して比較できる
 
 ```python
-# NG: タイムゾーンなし（ローカル時刻。サーバー設定に依存）
+# NG: タイムゾーンなし（ローカル時刻。サーバー設定に依）
 datetime.now()  # 2024-01-15 17:30:00（JSTなら日本時間）
 
 # OK: UTC明示
 datetime.now(timezone.utc).isoformat()  # 2024-01-15T08:30:00+00:00
 ```
 
-### 7.4 トランザクション安全なPaste作成
+### 7.4 閲覧数の原子性
+
+```python
+def increment_view_count(paste_id):
+    db = get_db()
+    row = db.execute(
+        "UPDATE pastes SET view_count = view_count + 1 WHERE paste_id = ? RETURNING view_count",
+        (paste_id,),
+    ).fetchone()
+    db.commit()
+    return row["view_count"] if row else 0
+```
+
+このアプリケーションでは、以下のすべてエンドポイントで閲覧時に `increment_view_count()` が呼ばれます。
+
+| エンドポイント | 用途 |
+|---------------|------|
+| `GET /paste/<paste_id>` | HTML表示（シンタックスハイライト付き） |
+| `GET /raw/<paste_id>` | 純粋なテキスト表示 |
+| `GET /api/pastes/<paste_id>` | APIによるJSON取得 |
+
+これは意図的な仕様です。いずれの方法でPasteにアクセスしても、閲覧としてカウントされます。
+
+`UPDATE pastes SET view_count = view_count + 1` は、データベース側で現在値に1を加算する方式です。Python側で現在値を読み込んで `+1` して書き戻す方式と比べて、同時アクセス時の競合に対してより安全です。
+
+さらに `RETURNING view_count` 句を使うことで、UPDATEと同じトランザクション内で更新後の値を取得します。これにより、同時アクセス時でも正確な更新後の値を返せます。
+
+#### RETURNING句について
+
+`RETURNING` はSQLite 3.35.0（2021年3月リリース）以降でサポートされています。現代のPython境では問題なく動作しますが、古い環境では以下の代替実装が必要です。
+
+```python
+# 古いSQLiteでの代替実装
+def increment_view_count_fallback(paste_id):
+    db = get_db()
+    db.execute("UPDATE pastes SET view_count = view_count + 1 WHERE paste_id = ?", (paste_id,))
+    db.commit()
+    # 別クエリで取得（競合の可能性がわずかに増える）
+    row = db.execute("SELECT view_count FROM pastes WHERE paste_id = ?", (paste_id,)).fetchone()
+    return row["view_count"] if row else 0
+```
+
+### 7.5 Paste作成時の補償処理
 
 ```python
 def create_paste(content, language, expires_at=None):
@@ -960,74 +1139,149 @@ def create_paste(content, language, expires_at=None):
             db.execute("BEGIN IMMEDIATE")
             ...
             db.execute("INSERT INTO pastes ...")
-            write_paste_file(paste_id, content)
             db.commit()
+
+            # Write file AFTER commit to minimize inconsistent window
+            try:
+                write_paste_file(paste_id, content)
+            except OSError:
+                # Compensate: delete DB record since file write failed
+                try:
+                    db.execute("DELETE FROM pastes WHERE paste_id = ?", (paste_id,))
+                    db.commit()
+                except Exception:
+                    logging.exception("Failed to compensate DB deletion for paste %s", paste_id)
+                raise
+
             return paste_id, delete_token
-        except Exception:
-            db.rollback()
-            remove_paste_file(paste_id)
-            raise
 ```
 
-#### BEGIN IMMEDIATE の意味
+#### なぜCOMMITの後にファイル書き込みを行うのか
 
-SQLiteのトランザクションには以下のモードがあります。
+作成時の順序として「DBのCOMMIT → ファイル書き込み」を採用しています。これにより、不整合の発生する時間的な窓を最小限に抑えます。
 
-| モード | 動作 |
-|--------|------|
-| `BEGIN DEFERRED` | 最初の読み書きまでロックを取得しない（デフォルト） |
-| `BEGIN IMMEDIATE` | 開始時に書き込みロックを取得 |
-| `BEGIN EXCLUSIVE` | 開始時に排他ロックを取得 |
+もし逆の順序（ファイル書き込み → DBのCOMMIT）にすると、ファイルは存在するがDBにレコードがない状態が長く続き、外部からファイルが見えてしまう可能性があります。
 
-`BEGIN IMMEDIATE` を使う理由は、**書き込み競合時のエラーを早期に検出**するためです。デフォルトの `DEFERRED` では、コミット時に競合が発見されることがあります。
+「DBのCOMMIT → ファイル書き込み」の順序では、DBにレコードがあるがファイルがない状態は一瞬だけです。ファイル書きみが失敗した場合は、DBレコードを削除して償します。
 
-#### ロールバッとクリーンアップ
+#### 残るリスク
 
-例外発生時の処理は以下の順序です。
+ただし、この方式でも以下のリスクは残ります。
 
-1. `db.rollback()` — データベースの変更を取り消し
-2. `remove_paste_file(paste_id)` — 作成途中のファイルを削除
+* COMMIT直後、ファイル書き込みの前にプロセスがクラッシュ → DBにレコードがあるがファイルがない
+* 補償のDELETE実行中にクラッシュ → DBにレコードがあるまま
 
-これにより、以下の不整合を防ぎます。
+これらは「DBとファイルを分離する」アーキテクチャでは避けられません。閲覧時にファイルが存在しない場合は404を返すことで、ユーザーへの影響は最小限に抑えます。
 
-* DBにレコードがあるがファイルがない
-* ファイルがあるがDBにレコードがない
-
-### 7.5 有効期限の処理
+### 7.6 削除時の処理順序
 
 ```python
-def is_expired(expires_at):
-    if not expires_at:
-        return False
-    expiry = parse_iso_datetime(expires_at)
-    return datetime.now(timezone.utc) > expiry
+def delete_paste(paste_id):
+    ...
+    delete_paste_from_db(paste_id)
+    file_removed = remove_paste_file(paste_id)
+
+    if not file_removed:
+        logging.warning("Failed to remove paste file during deletion: %s", paste_id)
 ```
 
-`expires_at` が `NULL`（無期限）の場合は常に `False` を返します。それ以外の場合は、現在のUTC時刻と比較します。
+削除時は**DBレコードを先に削除し、ファイル削除の失敗はログに記録**する方式を採用しています。
 
-#### なぜ閲覧時にチェックするのか
+#### なぜDBを先に削除するのか
 
-期限切れPasteの削除は `cleanup.py` で定期的に行いますが、クリーンアップの実行間隔中に期限が切れたPasteにもアクセスできる可能性があります。閲覧時にもチェックすることで、いつでも期限切れPasteを見せないことを保証します。
+DBを先に削除することで、外からの閲覧リクエストは即座に404を返します。ファイルが残っていても、DBにレコードがないため「存在しないPaste」として扱われます。
 
-### 7.6 API認証
+もしファイルを先に削除してDB削除が失敗すると、DBにレコードがあるがファイルがない状態になり、閲覧時に404が返される一方でDBにはゴミレコードが残ります。
+
+どちらの順序でも不整合は生じますが、DBを先に削除する方が、外部から見た一貫性は高くなります。
+
+### 7.7 APIの入力検証
 
 ```python
-def verify_api_key():
-    if not API_KEY:
-        return False
-    provided = request.headers.get("X-API-Key", "")
-    if not provided:
-        return False
-    return secrets.compare_digest(provided, API_KEY)
+def validate_paste_content(content):
+    if not isinstance(content, str):
+        return False, "Content must be a string."
+    if not content:
+        return False, "Paste content is required."
+    content_bytes = content.encode("utf-8")
+    if len(content_bytes) > MAX_PASTE_BYTES:
+        return False, "Paste too large."
+    return True, None
+
+
+def validate_expires_minutes(expires_minutes):
+    if expires_minutes is None or expires_minutes == "":
+        return True, None, None
+    try:
+        minutes = int(expires_minutes)
+        if minutes <= 0:
+            return False, None, "Expiration must be a positive integer."
+        if minutes > 525600 * 10:  # Max 10 years
+            return False, None, "Expiration too far in the future."
+        expires_at = (datetime.now(timezone.utc) + timedelta(minutes=minutes)).isoformat()
+        return True, expires_at, None
+    except (ValueError, TypeError):
+        return False, None, "Expiration must be a valid integer."
 ```
 
-API Keyは環境変数 `PASTEBIN_API_KEY` から取得します。設定されていない場合は、APIへのアクセスをすべて拒否します。
+APIの入力検証では、以下のチェックを行います。
 
-#### API Keyの生成
+| 検証項目 | チェック内容 |
+|----------|-------------|
+| contentの型 | `str` であること |
+| contentの存在 | 空文字列でないこと |
+| contentのサイズ | UTF-8エンコード後が512KB以下であること |
+| expires_minutesの型 | `int` に変換可能であること |
+| expires_minutesの範囲 | 正の整数、かつ10年以内であること |
 
-```bash
-export PASTEBIN_API_KEY="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
+`isinstance(content, str)` で型を確認することで、JSONで `{"content": 123}` のように数値を送信された場合を防ぎます。
+
+`expires_minutes` の上限（10年）、極端に長い有効期限による意図しないリソース消費を防ぐためです。必要に応じて調整してください。
+
+### 7.8 エラー応答の切り替え
+
+```python
+def wants_json():
+    accept = request.headers.get("Accept", "")
+    return request.is_json or accept.startswith("application/json")
+
+
+def error_response(message, status_code):
+    if wants_json():
+        return jsonify({"error": message}), status_code
+    # For browser requests, render HTML templates
+    if status_code == 404:
+        return render_template("404.html", message=message), status_code
+    ...
 ```
+
+APIクライアントにはJSON形式、ブラウザにはHTML形式でエラーを返します。判定基準は以下の通りです。
+
+* `request.is_json` — Content-Typeが `application/json` の場合True
+* `Accept` ヘッダーが `application/json` で始まる場合True
+
+これにより、curl等のAPIクライアントには `{"error": "..."}` が返され、ブラウザにはHTMLのエラーページが表示されます。
+
+### 7.9 削除トークンのけ渡し
+
+```python
+# index() — 作成時
+session[f"_delete_token_{paste_id}"] = delete_token
+
+# view_paste() — 表示時
+delete_token = session.pop(f"_delete_token_{paste_id}", None)
+```
+
+削除トークンは、作成直後にセッションに一時的に保存し、Paste表示ページで一度だけ取り出して表示します。`session.pop()` を使うことで、表示後にセッションから自動的に削除されます。
+
+#### なぜflash()ではなくsessionを使うのか
+
+`flash()` もセッションを使いますが、メッセージは次のリクエストまで保持されます。これにより、以下の問題が生じます。
+
+* ユーザーがページを更新してもトークンが表示され続ける
+* セッションに平文のトークンが意図せず残り続ける
+
+`session.pop()` を使うことで、**一度表示したら即座にセッションから削除**でき、トークンの露出時間を最小限に抑えます。
 
 ---
 
@@ -1039,7 +1293,6 @@ export PASTEBIN_API_KEY="$(python -c 'import secrets; print(secrets.token_urlsaf
 import logging
 import os
 import sqlite3
-import sys
 from datetime import datetime, timezone
 
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
@@ -1053,6 +1306,16 @@ logging.basicConfig(
 
 
 def cleanup():
+    """
+    Delete expired pastes from both database and filesystem.
+
+    Order: query expired pastes -> delete each file -> delete DB records -> commit
+
+    If a file deletion fails, the DB record is kept and will be retried
+    on the next cleanup run. If commit fails after file deletions,
+    orphan files may remain. These are handled by the read path
+    returning 404 when the DB record is missing.
+    """
     conn = sqlite3.connect(DATABASE_PATH)
     conn.row_factory = sqlite3.Row
 
@@ -1064,24 +1327,37 @@ def cleanup():
     ).fetchall()
 
     deleted_count = 0
+    failed_files = []
 
     for row in rows:
         paste_id = row["paste_id"]
         file_path = os.path.join(PASTE_DIR, paste_id)
 
-        try:
-            os.remove(file_path)
-            logging.info("Removed expired paste file: %s", paste_id)
-        except OSError:
-            logging.warning("Failed to remove paste file: %s", paste_id)
+        # Attempt to delete file first
+        file_ok = True
+        if os.path.isfile(file_path):
+            try:
+                os.remove(file_path)
+                logging.info("Removed expired paste file: %s", paste_id)
+            except OSError as e:
+                file_ok = False
+                failed_files.append(paste_id)
+                logging.warning("Failed to remove paste file %s: %s", paste_id, e)
 
+        # Delete DB record regardless of file deletion success.
+        # If file deletion failed, the DB record will be removed
+        # and subsequent reads will return 404.
         conn.execute("DELETE FROM pastes WHERE paste_id = ?", (paste_id,))
         deleted_count += 1
 
     conn.commit()
     conn.close()
 
-    logging.info("Cleanup completed. Deleted %d expired pastes.", deleted_count)
+    logging.info(
+        "Cleanup completed. Deleted %d expired pastes. File failures: %d",
+        deleted_count,
+        len(failed_files),
+    )
 
 
 if __name__ == "__main__":
@@ -1090,7 +1366,7 @@ if __name__ == "__main__":
 
 ### 8.1 なぜ独立スクリプトにするのか
 
-Flaskアプリケーション内にクリーンアップ処理を組み込む方法もあります（例：`threading.Timer` で定期実行）。しかし、以下の理由で独立スクリプトを推奨しま。
+Flaskアプリケーション内にクリーンアップ処理を組み込む方法もあります（例：`threading.Timer` で定期実行）。しかし、以下の理由で独立スクリプトを推奨します。
 
 | 方法 | 問題 |
 |------|------|
@@ -1099,7 +1375,30 @@ Flaskアプリケーション内にクリーンアップ処理を組み込む方
 | 独立スクリプト | cronやsystemd timerで管理でき、実行タイミングを外部制御できる |
 | 独立スクリプト | テスト・手動実行が容易 |
 
-### 8.2 定期実行の設定
+### 8.2 クリーンアップ時の不整合について
+
+クリーンアップスクリプトでは、以下の順序で処理を行います。
+
+1. 期限切れのPasteをDBから検索
+2. 各Pasteについて、ファイルを削除
+3. DBからレコードを削除
+4. `commit()`
+
+ファイル削除とDB削除の間でエラーが発生した場合、以下の不整が起こり得ます。
+
+| 状況 | 結果 |
+|------|------|
+| ファイル削除成功 → DB削除成功 → commit成功 | 整合 |
+| ファイル削除失敗 → DB削除成功 → commit成功 | DBにないがファイルが残る（孤立ファイル）→ 不整合 |
+| ファイル削除成功 → DB削除成功 → commit失敗 | ファイルがないがDBレコードが残る → 不整合 |
+
+これらの不整合は、DBとファイルを分離しているアーキテクチャでは避けられません。以下の対応を推奨します。
+
+* ログを監視して失敗を検知する
+* 定期的に `pastes/` ディレクトリとDBを照合し、孤立ファイルを削除する
+* 閲覧時にファイルがない場合は404を返す（DBレコードがあっても）
+
+### 8.3 定期実行の設定
 
 #### cron を使う場合
 
@@ -1276,6 +1575,13 @@ sudo systemctl start pastebin-cleanup.timer
             {{ paste_content|safe }}
         </div>
 
+        {% if delete_token %}
+        <div class="message info">
+            <strong>Delete Token:</strong> <code>{{ delete_token }}</code>
+            <p>Save this token if you want to delete this paste later.</p>
+        </div>
+        {% endif %}
+
         <hr>
 
         <form method="post" action="{{ url_for('delete_paste', paste_id=paste_id) }}" novalidate>
@@ -1344,8 +1650,6 @@ sudo systemctl start pastebin-cleanup.timer
 ---
 
 ## 10. CSS
-
-ファイルベース版に以下を追加します。
 
 ```css
 * {
@@ -1618,12 +1922,12 @@ curl -X DELETE http://127.0.0.1:5000/api/pastes/Ab3xK9Lm2Q \
 
 ### ファイルベース版から継承
 
-| 威 | 対策 |
+| 脅威 | 対策 |
 |------|------|
 | パストラバーサル | Paste IDの正規表現検証 |
 | CSRF攻撃 | CSRFトークンの生成と検証 |
 | DoS（サイズ攻撃） | リクエストサイズ上限 |
-| ファイル上書き | `"x"` モードでの排他作成 |
+| ファイル上書き | `"x"` モードの排他作成 |
 | XSS | Pygmentsによる安全なHTML変換 |
 | セッション窃取 | `HttpOnly`, `SameSite`, `Secure` Cookie属性 |
 | 二重投稿 | PRGパターン |
@@ -1633,11 +1937,19 @@ curl -X DELETE http://127.0.0.1:5000/api/pastes/Ab3xK9Lm2Q \
 
 | 脅威 | 対策 |
 |------|------|
-| 削除トークンの漏洩 | SHA-256ハッシュ化で保存 |
+| 削除トークンの漏洩 | SHA-256ハッシュ化で保存（十分なエトロピーのトークンが前提） |
 | 不正なAPIアクセス | `X-API-Key` ヘッダー認証 |
 | 期限切れPasteの閲覧 | 閲覧時の有効期限チェック |
-| DBとファイルの不整合 | トランザクションとロールバック |
+| DBとファイルの不整合 | 補償処理とログ記録で不整合を減らす |
 | 情報漏洩 | エラー詳細の隠蔽、一律404 |
+| 同時アクセス時の閲覧数 | `RETURNING` 句による原子性の確保 |
+
+### 未対策の項目（別途検討が必要）
+
+| 脅威 | 現状 | 対策案 |
+|------|------|--------|
+| APIの大量投稿 | レートリミットなし | Flask-Limiter等の導入 |
+| DBとファイルの完全な整合性 | 分離アーキテクチャの限界 | 本文もDBに入れる、または2PC等 |
 
 ---
 
@@ -1645,9 +1957,13 @@ curl -X DELETE http://127.0.0.1:5000/api/pastes/Ab3xK9Lm2Q \
 
 ### 14.1 移行の考え方
 
-ファイルベース版からSQLite版へ移行する場合、既存のPasteファイルをSQLiteに登録するスクリプトが必要です。
+ファイルベース版からSQLite版へ移行する場合、以下の変換が必要です。
 
-### 14.2 移スクリプト例
+* 旧ファイル形式（1行目に言語情報、その後に本文）から、言語情報をDBに移行
+* 本文だけを新しいファイル形式で保存
+* 作成日時はファイルのmtimeを参考にするが、正確な日時ではないことを理解する
+
+### 14.2 移行スクリプト
 
 ```python
 import os
@@ -1664,11 +1980,27 @@ for filename in os.listdir(PASTE_DIR):
     if not os.path.isfile(filepath):
         continue
 
+    # Read old format: first line is language, rest is content
     with open(filepath, "r", encoding="utf-8") as f:
-        language = f.readline().strip()
+        lines = f.readlines()
 
+    if not lines:
+        continue
+
+    language = lines[0].strip()
+    content = "".join(lines[1:])
+
+    # Write new format: content only (language is in DB)
+    with open(filepath, "w", encoding="utf-8") as f:
+        f.write(content)
+
+    # Use file modification time as a fallback for created_at.
+    # Note: mtime may not reflect the actual creation time
+    # and is OS-dependent. For accurate migration, creation time
+    # should have been recorded separately in the old system.
+    mtime = os.path.getmtime(filepath)
     created_at = datetime.fromtimestamp(
-        os.path.getctime(filepath),
+        mtime,
         tz=timezone.utc
     ).isoformat()
 
@@ -1681,6 +2013,12 @@ conn.commit()
 conn.close()
 ```
 
+#### 移行スクリプトの注意点
+
+1. **言語情報の抽出** — 旧ファイルの1行目を言語として読み取り、DBに保存します
+2. **本文の書き換え** — 言語行を除いた本文だけをファイルに書き戻します
+3. **作成日時** — `os.path.getmtime()` を使用しますが、これは正確な作成日時ではありません。ファイルのコピー操作等でも値が変わる可能性があります
+
 ---
 
 ## 15. まとめ
@@ -1692,10 +2030,9 @@ conn.close()
 | 機能 | ファイルベース版 | SQLite版 |
 |------|----------------|----------|
 | 有効期限 | 不可 | 可能 |
-| 閲覧数 | 不可 | 自動カウント |
+| 閲覧数 | 不可 | 自動カウント（全エンドポイントで統一） |
 | 削除機能 | 不可 | トークン認証付き |
-| API | 不可 | REST風API |
-| トランザクション安全 | 部分的 | 完全 |
+| API | 不可 | REST風API（レートリミットは別途検討） |
 | UTC日時管理 | 不可 | 統一 |
 | 定期クリーンアップ | 不可 | 独立スクリプト |
 
@@ -1703,8 +2040,17 @@ conn.close()
 
 * **本文はファイル** — 大きなテキストを効率的に管理
 * **メタデータはSQLite** — 構造化データを安全に管理
-* **トランザクションで整合性を保証** — DBとファイルの不整合を防ぐ
+* **不整合を減らす設計** — 補償処理とログ記録でDBとファイルの不整合を最小化
 * **UTC日時を統一** — タイムゾーンの混乱を排除
 * **独立したクリーンアップ** — 運用時の柔軟性を確保
 
-この構成は、小〜中規模のPastebinサービスとして十分実用的です。さらに大規模化する場合は、PostgreSQL等の本格的なRDBMSや、オブジェクトストレージの検討が必要になりますが、その判断基準もこのチュートリアルで示した設計思想を参考にできます。
+### この構成の限界
+
+DBとファイルを分離しているため、**完全な原子性は保証できません**。これはアーキテクチャの本質的な制約です。以下の不整合が理論上は起こり得ます。
+
+* DBにレコードがあるがファイルがない（作成時のクラッシュ）
+* ファイルがあるがDBにレコードがない（削除時の失敗）
+
+これらの不整合は、閲覧時の404応答やクリーンアップスクリプトで緩和されますが、完全には排除できません。完全な整合性が必要な場合は、本文もSQLiteに保存するか、より高度な分散トランザクション機構を検討してください。
+
+この構成は、小〜中規模のPastebinサービスとして十分実用的です。さらに大規模化する場合は、PostgreSQL等の本格的なRDBMSや、オブジェクトストレージの検討が必要になりますが、その判断基準もこのチュートリアルで示した設計思想を参考にでます。
