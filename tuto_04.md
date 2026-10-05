@@ -65,7 +65,7 @@ SQLiteに本文も保存できますが、この構成では**メタデータの
 | 状況 | 結果 |
 |------|------|
 | DBにINSERT成功 → ファイル書き込み失敗 → 補償削除成功 | DBにもファイルもない → 整合 |
-| DBにINSERT成功 → ファイル書き込み成功 | DBにもファイルもある → 合 |
+| DBにINSERT成功 → ファイル書き込み成功 | DBにもファイルもある → 整合 |
 | DBにINSERT成功 → COMMIT → ファイル書き込み直前にクラッシュ | DBにレコードがあるがファイルがない → 不整合 |
 | 削除時：DB削除成功 → ファイル削除失敗 | DBにないがファイルだけ残る（孤立ファイル）→ 不整合 |
 
@@ -104,7 +104,7 @@ SQLiteに本文も保存できますが、この構成では**メタデータの
 * **閲覧数カウント** — `/paste/`、`/raw/`、`/api/pastes/` のすべてのアクセスで自動的にカウント（仕様として統一）。ただし `HEAD` リクエストでは加算しない
 * **削除機能** — 削除トークンを使ったPaste削除
 * **作成日時の記録** — UTCで統一管理
-* **API** — HTTPヘッダー認証付きのREST風API（レートリミットは別途検討が必要）。APIートは常にJSONを返す
+* **API** — HTTPヘッダー認証付きのREST風API（レートリミットは別途検討が必要）。APIルートは常にJSONを返す
 * **定期クリーンアップ** — 期限切れPasteの削除スクリプト
 
 ---
@@ -342,10 +342,13 @@ logging.basicConfig(
 
 def get_db():
     if "db" not in g:
-        conn = sqlite3.connect(DATABASE_PATH, timeout=10.0)
+        # isolation_level=None: manual transaction management.
+        # This avoids conflict between explicit BEGIN and Python sqlite3's
+        # implicit transaction handling.
+        conn = sqlite3.connect(DATABASE_PATH, timeout=10.0, isolation_level=None)
         conn.row_factory = sqlite3.Row
         # Enable WAL mode for better concurrent read/write performance
-        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA journal_mode=WAL").fetchone()
         conn.execute("PRAGMA busy_timeout=5000")
         g.db = conn
     return g.db
@@ -491,18 +494,20 @@ def increment_view_count(paste_id):
     Increment view count and return the updated value.
     Uses RETURNING clause to get the new value atomically.
     Skips increment for HEAD requests.
+    Returns None if the paste no longer exists (deleted by another request).
     """
     if request.method == "HEAD":
         row = get_paste_from_db(paste_id)
-        return row["view_count"] if row else 0
+        return row["view_count"] if row else None
 
     db = get_db()
     row = db.execute(
-        "UPDATE pastes SET view_count = view_count + 1 WHERE paste_id = ? RETURNING view_count",
+        "UPDATE pastes SET view_count = view_count + 1 "
+        "WHERE paste_id = ? RETURNING view_count",
         (paste_id,),
     ).fetchone()
     db.commit()
-    return row["view_count"] if row else 0
+    return row["view_count"] if row else None
 
 
 def delete_paste_from_db(paste_id):
@@ -802,6 +807,8 @@ def view_paste(paste_id):
 
     # Atomically increment and get the updated view count
     view_count = increment_view_count(paste_id)
+    if view_count is None:
+        return error_response("Paste not found.", 404)
 
     content = read_paste_file(paste_id)
     language = sanitize_language(row["language"])
@@ -849,10 +856,12 @@ def raw_paste(paste_id):
         return error_response("Paste not found.", 404)
 
     row = get_paste_from_db(paste_id)
-    if not row or is_expired(row["expires_at"]):
+    if not row:
         return error_response("Paste not found.", 404)
 
-    increment_view_count(paste_id)
+    view_count = increment_view_count(paste_id)
+    if view_count is None:
+        return error_response("Paste not found.", 404)
 
     content = read_paste_file(paste_id)
 
@@ -968,6 +977,9 @@ def api_get_paste(paste_id):
         return api_error("Paste not found.", 404)
 
     view_count = increment_view_count(paste_id)
+    if view_count is None:
+        return api_error("Paste not found.", 404)
+
     content = read_paste_file(paste_id)
 
     return jsonify({
@@ -1012,27 +1024,27 @@ def api_delete_paste(paste_id):
 
 @app.errorhandler(400)
 def bad_request(error):
-    return web_error("Bad request.", 400)
+    return error_response("Bad request.", 400)
 
 
 @app.errorhandler(401)
 def unauthorized(error):
-    return web_error("Unauthorized.", 401)
+    return error_response("Unauthorized.", 401)
 
 
 @app.errorhandler(403)
 def forbidden(error):
-    return web_error("Forbidden.", 403)
+    return error_response("Forbidden.", 403)
 
 
 @app.errorhandler(404)
 def not_found(error):
-    return web_error("Paste not found.", 404)
+    return error_response("Paste not found.", 404)
 
 
 @app.errorhandler(413)
 def request_too_large(error):
-    return web_error("Payload too large.", 413)
+    return error_response("Payload too large.", 413)
 
 
 # ============================================================
@@ -1281,7 +1293,7 @@ def create_paste(content, language, expires_at=None):
 
 作成時の順序として「DBのCOMMIT → ファイル書き込み」を採用しています。これにより、不整合の発生する時間的な窓を最小限に抑えます。
 
-もし逆の順序（ファイル書き込み → DBのCOMMIT）にすると、ファイルは存在するがDBにレコードがない状態が長く続き、外部からファイルが見えてしまう可能がありま。
+もし逆の順序（ファイル書き込み → DBのCOMMIT）にすると、ファイルは存在するがDBにレコードがない状態が長く続き、外部からファイルが見えてしまう可能性があります。
 
 「DBのCOMMIT → ファイル書き込み」の順序では、DBにレコードがあるがファイルがない状態は一瞬だけです。ファイル書き込みが失敗した場合は、DBレコードを削除して補償します。
 
@@ -1306,7 +1318,7 @@ def delete_paste(paste_id):
         logging.warning("Failed to remove paste file during deletion: %s", paste_id)
 ```
 
-削除時は**DBレコードを先に除し、ファイル削除の失敗はログに記録**する方式を採用しています。
+削除時は**DBレコードを先に削除し、ファイル削除の失敗はログに記録**する方式を採用しています。
 
 #### なぜDBを先に削除するのか
 
@@ -1424,7 +1436,7 @@ Flaskの `MAX_CONTENT_LENGTH` はHTTPリクエスト全体のサイズを制限�
 | `MAX_CONTENT_LENGTH` | 約1.5MB | HTTPリクエスト全体の上限（DoS対策） |
 | `MAX_PASTE_BYTES` | 512KB | Paste本文の実際の上限 |
 
-#### textarea の maxlength にいて
+#### textarea の maxlength について
 
 ```html
 <textarea maxlength="524288">
@@ -1446,7 +1458,7 @@ delete_token = session.pop(f"_delete_token_{paste_id}", None)
 
 削除トークンは、作成直後にセッションに一時的に保存し、Paste表示ページで一度だけ取り出して表示します。`session.pop()` を使うことで、表示後にセッションから自動的に削除されます。
 
-#### セュリティ上の注意
+#### セキュリティ上の注意
 
 Flaskのセッションは**署名はされるが暗号化はされません**。つまり、Cookieの内容は改ざんを検出できますが、中身を読むことは可能です。削除トークンはbase64エンコーディングされたCookieに平文で含まれます。
 
@@ -1457,6 +1469,19 @@ Flaskのセッションは**署名はされるが暗号化はされません**�
 * HTTPS環境ではネットワーク上で暗号化される
 
 より高いセキュリティが必要な場合は、サーバー側（Redisや別テーブル）にトークンを保存してください。
+
+#### 削除トークンの表示について
+
+作成直後のリダイレクト先で削除トークンが一度だけ表示されますが、ユーザーがページを再読込すると `session.pop()` によりトークンは消えます。UI的には「このページを閉じるとトークンは再表示できません」という警告を表示するのが親切です。
+
+```html
+{% if delete_token %}
+<div class="message info">
+    <strong>Delete Token:</strong> <code>{{ delete_token }}</code>
+    <p>⚠️ Save this token now. It will NOT be shown again after you leave this page.</p>
+</div>
+{% endif %}
+```
 
 ---
 
@@ -1498,6 +1523,7 @@ def cleanup():
     """
     conn = sqlite3.connect(DATABASE_PATH)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=5000")
 
     now = datetime.now(timezone.utc).isoformat()
 
@@ -1543,6 +1569,7 @@ def cleanup_orphan_files():
     """
     conn = sqlite3.connect(DATABASE_PATH)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=5000")
 
     rows = conn.execute("SELECT paste_id FROM pastes").fetchall()
     valid_ids = {row["paste_id"] for row in rows}
@@ -1599,7 +1626,27 @@ Flaskアプリケーション内にクリーンアップ処理を組み込む方
 
 これらの不整合は、DBとファイルを分離しているアーキテクチャでは避けられません。`cleanup_orphan_files()` 関を定期的に実行することで、孤立ファイルを検出・削除できます。
 
-### 8.3 定期実行の設定
+### 8.3 cleanup.py の busy_timeout
+
+```python
+conn = sqlite3.connect(DATABASE_PATH)
+conn.row_factory = sqlite3.Row
+conn.execute("PRAGMA busy_timeout=5000")
+```
+
+`cleanup.py` でも `busy_timeout=5000` を設定しています。Flaskアプリが書き込み中にクリーンアップが走ると、ロック競合が発生します。`busy_timeout` がないと、即座に `SQLITE_BUSY` エラーで失敗します。5秒の待機時間を設けることで、短時間のロック競合を回避できます。
+
+`cleanup_orphan_files()` 側の接続にも同様に設定しています。
+
+### 8.4 PRAGMA の結果フェッチについて
+
+```python
+conn.execute("PRAGMA journal_mode=WAL").fetchone()
+```
+
+`PRAGMA journal_mode=WAL` は結果行を返します。フェッチしなくても実害はほぼありませんが、cursorが開いたままになり、場合によっては `ProgrammingError` の原因になることがあります。`fetchone()` で結果を消費することで、cursorを確実に閉じます。
+
+### 8.5 定期実行の設定
 
 #### cron を使う場合
 
@@ -1779,7 +1826,7 @@ sudo systemctl start pastebin-cleanup.timer
         {% if delete_token %}
         <div class="message info">
             <strong>Delete Token:</strong> <code>{{ delete_token }}</code>
-            <p>Save this token if you want to delete this paste later.</p>
+            <p>⚠️ Save this token now. It will NOT be shown again after you leave this page.</p>
         </div>
         {% endif %}
 
@@ -2196,6 +2243,10 @@ curl -X DELETE http://127.0.0.1:5000/api/pastes/Ab3xK9Lm2Q \
 
 APIの **作成（POST）** と **削除（DELETE）** には `X-API-Key` ヘッダーによる認証が必要です。**取得（GET）** は認証なしでアクセスできます。これは意図的な仕様です。Pasteの共有（閲覧）は認証なしで行えるように、管理操作（作成・削除）のみ認証を要求するためです。
 
+#### 注意：API GET での閲覧数
+
+API GET も閲覧数をインクリメントします。認証なしでアクセスできるため、第三者が繰り返しリクエストすることで閲覧数を水増しできる可能性があります。これはレートリミット未実装の現状では防ぎきれませんAPIルートへのレートリミット導入を検討してください。
+
 ---
 
 ## 13. セキュリティ対策のまとめ
@@ -2234,6 +2285,7 @@ APIの **作成（POST）** と **削除（DELETE）** には `X-API-Key` ヘッ
 | APIの大量投稿 | レートリミットなし | Flask-Limiter等の導入 |
 | DBとファイルの完全な整合性 | 分離アーキテクチャの限界 | 本文もDBに入れる、または2PC等 |
 | セッションの平文トークン | 署名のみ、暗号化なし | サーバー側ストレージへの移行 |
+| API GETでの閲覧数水増し | 認証なしでアクセス可能 | APIルートへのレートリミット導入 |
 
 ---
 
@@ -2245,7 +2297,7 @@ APIの **作成（POST）** と **削除（DELETE）** には `X-API-Key` ヘッ
 
 * 旧ファイル形式（1行目に言語情報、その後に本文）から、言語情報をDBに移行
 * 本文だけを新しいファイル形式で保存
-* 作成日時はファイルのmtimeを参考にするが、正な日時ではないことを理解する
+* 作成日時はファイルのmtimeを参考にするが、正確な日時ではないことを理解する
 
 ### 14.2 移行スクリプト
 
@@ -2268,13 +2320,32 @@ import os
 import sqlite3
 from datetime import datetime, timezone
 
-PASTE_DIR = "pastes"
-DB_PATH = "pastes.db"
+from pygments.lexers import get_all_lexers
+
+BASE_DIR = os.path.abspath(os.path.dirname(__file__))
+PASTE_DIR = os.path.join(BASE_DIR, "pastes")
+DB_PATH = os.path.join(BASE_DIR, "pastes.db")
+
+# Rebuild allowed language set (same logic as app.py)
+ALLOWED_LANGUAGES = set()
+for _, aliases, _, _ in get_all_lexers():
+    for alias in aliases:
+        ALLOWED_LANGUAGES.add(alias)
+
+
+def sanitize_language(language):
+    if not isinstance(language, str):
+        return "text"
+    language = language.strip().lower()
+    if language in ALLOWED_LANGUAGES:
+        return language
+    return "text"
 
 
 def migrate():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=5000")
 
     # Ensure table exists
     conn.executescript("""
@@ -2315,7 +2386,8 @@ def migrate():
         if not lines:
             continue
 
-        language = lines[0].strip()
+        # Validate language before inserting into DB
+        language = sanitize_language(lines[0].strip())
         content = "".join(lines[1:])
 
         # Write new format atomically using temp file + replace
@@ -2360,6 +2432,28 @@ if __name__ == "__main__":
 #### mtimeの取得順序
 
 ファイルの `mtime` は**ファイル書き換えの前**に取得します。書き換え後に取得すると、移行実行時刻になってしまいます。
+
+#### 言語の検証
+
+```python
+from pygments.lexers import get_all_lexers
+
+ALLOWED_LANGUAGES = set()
+for _, aliases, _, _ in get_all_lexers():
+    for alias in aliases:
+        ALLOWED_LANGUAGES.add(alias)
+
+
+def sanitize_language(language):
+    if not isinstance(language, str):
+        return "text"
+    language = language.strip().lower()
+    if language in ALLOWED_LANGUAGES:
+        return language
+    return "text"
+```
+
+旧ファイルの1行目の言語名をそのままDBに挿入するのではなく、`sanitize_language()` で検証します。無効な言語名は `"text"` にフォールバックされます。これにより、DBに無効な言語名が残ることを防ぎます。
 
 #### アトミックなファイル書き込み
 
@@ -2408,7 +2502,7 @@ shortuuidはUUIDをBase57エンコーディングした文字列を生成しま�
 | 削除機能 | 不可 | トークン認証付き |
 | API | 不可 | REST風API（レートリミットは別途検討） |
 | UTC日時管理 | 不可 | 統一 |
-| 定クリーンアップ | 不可 | 独立スクリプト |
+| 定期クリーンアップ | 不可 | 独立スクリプト |
 
 ### 構成の特徴
 
@@ -2427,6 +2521,6 @@ DBとファイルを分離しているため、**完全な原子性は保証で�
 * DBにレコードがあるがファイルがない（作成時のクラッシュ）
 * ファイルがあるがDBにレコードがない（削除時の失敗）
 
-これらの不整合は、閲覧時の404応答やクリーンアップスクリプトで緩和されますが、完全には除できません。完全な整合性が必要な場合は、本文もSQLiteに保存するか、より高度な分散トランザクション機構を検討してください。
+これらの不整合は、閲覧時の404応答やクリーンアップスクリプトで緩和されますが、完全には除去できません。完全な整合性が必要な場合は、本文もSQLiteに保存するか、より高度な分散トランザクション機構を検討してください。
 
 この構成は、小〜中規模のPastebinサービスとして十分実用的です。さらに大規模化する場合は、PostgreSQL等の本格的なRDBMSや、オブジェクトストレージの検討が必要になりますが、その判断基準もこのチュートリアルで示した設計思想を参考にできます。
