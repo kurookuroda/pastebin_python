@@ -128,7 +128,9 @@ pastebin/
 │   ├── 401.html        ← Unauthorized
 │   ├── 403.html        ← Forbidden
 │   ├── 404.html        ← Not Found
-│   └── 413.html        ← Payload Too Large
+│   ├── 405.html        ← Method Not Allowed
+│   ├── 413.html        ← Payload Too Large
+│   └── 500.html        ← Internal Server Error
 └── static/
     └── style.css
 ```
@@ -145,6 +147,8 @@ pastebin/
 | `templates/400.html` | 不正なリクエスト時のエラーページ |
 | `templates/401.html` | 未認証時のエラーページ |
 | `templates/403.html` | 権限不足時のエラーページ |
+| `templates/405.html` | 許可されていないHTTPメソッドのエラーページ |
+| `templates/500.html` | 想定外のエラー（サーバー内部エラー）のページ |
 
 ---
 
@@ -692,6 +696,10 @@ def web_error(message, status_code):
         return render_template("401.html", message=message or "Unauthorized."), status_code
     if status_code == 403:
         return render_template("403.html", message=message or "Forbidden."), status_code
+    if status_code == 405:
+        return render_template("405.html", message=message or "Method not allowed."), status_code
+    if status_code == 500:
+        return render_template("500.html", message=message or "Internal server error."), status_code
     return render_template("404.html", message=message), status_code
 
 
@@ -1061,6 +1069,22 @@ def request_too_large(error):
     return error_response("Payload too large.", 413)
 
 
+@app.errorhandler(405)
+def method_not_allowed(error):
+    response = app.make_response(error_response("Method not allowed.", 405))
+    # A 405 response must tell the client which methods are allowed.
+    if error.valid_methods:
+        response.headers["Allow"] = ", ".join(error.valid_methods)
+    return response
+
+
+@app.errorhandler(500)
+def internal_server_error(error):
+    # Never put exception details in the response.
+    # Flask has already logged the exception before calling this handler.
+    return error_response("Internal server error.", 500)
+
+
 # ============================================================
 # Main
 # ============================================================
@@ -1428,6 +1452,36 @@ APIルート（`/api/` で始まるパス）は**常にJSON**を返します。�
 curlのデフォルトでは `Accept: */*` が送信されます。これは `application/json` に前方一致しないため、`wants_json()` ベースの判定ではAPIエラーがHTMLで返ってしまいます。
 
 パスベース（`request.path.startswith("/api/")`）の判定であれば、curlのデフォルト設定でも確実にJSONが返されます。
+
+#### すべてのエラーを `error_response()` に通す
+
+エラーハンドラを登録していないステータスは、Flask（Werkzeug）の標準のHTMLエラーページが返されます。`/api/` 配下でも同じです。
+
+以前は 400・401・403・404・413 だけにハンドラがあり、次の2つが抜けていました。
+
+| ステータス | 起きる場面 |
+|------------|------------|
+| 405 | `GET /api/pastes` のように、そのURLで許可されていないHTTPメソッドを使ったとき |
+| 500 | 想定外の例外が起きたとき |
+
+このため、APIクライアントが `{"error": ...}` を期待していても、HTMLが返ることがありました。405 と 500 にもハンドラを追加し、すべてのエラーが `error_response()` を通るようにしました。
+
+```python
+@app.errorhandler(405)
+def method_not_allowed(error):
+    response = app.make_response(error_response("Method not allowed.", 405))
+    if error.valid_methods:
+        response.headers["Allow"] = ", ".join(error.valid_methods)
+    return response
+
+
+@app.errorhandler(500)
+def internal_server_error(error):
+    return error_response("Internal server error.", 500)
+```
+
+* **405 の `Allow` ヘッダー** — HTTPの仕様では、405 の応答には許可されているメソッドを `Allow` ヘッダーで伝える必要があります。標準の応答には付いていますが、自前のレスポンスに置き換えると失われるため、`error.valid_methods` から付け直しています。
+* **500 のメッセージ** — 例外の内容（スタックトレースや例外メッセージ）は、応答に含めません。固定のメッセージだけを返します。例外の詳細は、ハンドラが呼ばれる前に Flask がログへ記録しているので、原因の調査はログで行えます。
 
 ### 7.11 サイズ制限の設計
 
@@ -2094,6 +2148,54 @@ sudo systemctl start pastebin-cleanup.timer
 </html>
 ```
 
+### 9.8 405.html
+
+```html
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Pastebin — Method Not Allowed</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+<div class="container">
+    <h1><a href="{{ url_for('index') }}">Pastebin</a></h1>
+    <section class="error-page">
+        <h2>Method Not Allowed</h2>
+        <p>{{ message or "The method is not allowed for this URL." }}</p>
+        <p><a href="{{ url_for('index') }}">Back to Pastebin</a></p>
+    </section>
+</div>
+</body>
+</html>
+```
+
+### 9.9 500.html
+
+```html
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Pastebin — Server Error</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+<div class="container">
+    <h1><a href="{{ url_for('index') }}">Pastebin</a></h1>
+    <section class="error-page">
+        <h2>Internal Server Error</h2>
+        <p>{{ message or "Something went wrong on the server." }}</p>
+        <p><a href="{{ url_for('index') }}">Back to Pastebin</a></p>
+    </section>
+</div>
+</body>
+</html>
+```
+
 ---
 
 ## 10. CSS
@@ -2404,6 +2506,8 @@ API GET も閲覧数をインクリメントします。認証なしでアクセ
 | 無効なUnicode | `UnicodeEncodeError` の検証 |
 | 改行コードの不整合 | 保存前の `CRLF` → `LF` 正規化 |
 | 非ASCII文字による比較エラー | UTF-8のバイト列にしてから `compare_digest` で比較 |
+| 許可されていないHTTPメソッド | 405 を `Allow` ヘッダー付きで返す（APIはJSON） |
+| 想定外のエラーによる内部情報の漏洩 | 500 は固定メッセージのみ返し、例外の内容はログにだけ記録（APIはJSON、ブラウザはHTML） |
 | SQLiteのロック競合 | WALモードと `busy_timeout` |
 
 ### 未対策の項目（別途検討が必要）
