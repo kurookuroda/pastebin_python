@@ -12,7 +12,7 @@
 
 ### 新規・強化されたAPI機能
 
-- **認証方式の分離** — 汎用APIキー (`X-API-Key`) と GitHub Webhook署名検証 (`X-Hub-Signature-256`) を独立した環境変数で管理
+- **認証方式の分離** — 汎用APIキー (`X-API-Key`) と GitHub Webhook署名検証 (`X-Hub-Signature-256`) を独立した環境変数で理
 - **マルチパターン認証** — 1つのエンドポイントで「内部スクリプトからのAPI利用」と「外部サービスからのWebhook受信」の両方を安全に処理
 - **GitHub Webhook対応** — ペイロードの署名検証に対応し、送信元の真正性を担保。Webhook 作成時に送られる `ping` イベントにも正しく応答します
 
@@ -531,7 +531,7 @@ python app.py
 
 > **セキュアバイデフォルト**: `PASTEBIN_API_KEY` も `GITHUB_WEBHOOK_SECRET` も設定されていない場合、APIエンドポイントは `403 Forbidden` を返して完全に無効化されます。設定ミスによる事故防止になっています。
 
-> **レート制限の実効上限**: デフォルト制限 (`200/day`, `50/hour`) と API 制限 (`10/minute`) が**両方とも**適用されます。そのため実効的な上限は `1時間あたり最大50件` です。内部ツールの利用頻度に応じて `default_limits` や `@limiter.limit` の値を調整してください。また、GitHub Webhook の連続イベント (push のバースト等) で 429 が返る可能性がある場合は、Webhook 経路の制限を緩くする等の調整が必要です。
+> **レート制限の実効的な上限**: デフォルト制限 (`200/day`, `50/hour`) と API 制限 (`10/minute`) が**両方とも**適用されます。そのため実効的な上限は `1時間あたり最大50件` です。内部ツールの利用頻度に応じて `default_limits` や `@limiter.limit` の値を調整してください。また、GitHub Webhook の連続イベント (push のバースト等) で 429 が返る可性がある場合は、Webhook 経路の制限を緩くする等の調整が必要です。
 
 ---
 
@@ -565,7 +565,7 @@ GitHub リポジトリの Settings → Webhooks で以下を設定します。
 - **Content type**: `application/json`
 - **Secret**: `GITHUB_WEBHOOK_SECRET` と同じ値
 
-作成時に送られる `ping` イベントには `{"status": "pong"}` が返り、GitHub 側で「緑のチェックマーク」がつきます。
+作成時に送られる `ping` イベントには `{"status": "pong"}` が返り、GitHub 側「緑のチェックマーク」がつきます。
 
 ### 6.3 エラーパターン
 
@@ -597,8 +597,9 @@ import requests
 WEBHOOK_URL = "http://127.0.0.1:5000/api/v1/paste"
 API_KEY = "my-super-secret-api-key-12345"
 
+
 def post_paste(content: str, language: str = "text") -> str:
-    """テキストをPastebinに投稿し、ブラウザで開けるURLを返す。"""
+    """キストをPastebinに投稿し、ブラウザで開けるURLを返す。"""
     response = requests.post(
         WEBHOOK_URL,
         headers={
@@ -630,3 +631,168 @@ if __name__ == "__main__":
 $ some-command --verbose | python post_paste.py
 Paste created: http://127.0.0.1:5000/paste/xY3zA9QbLm
 ```
+
+---
+
+## 8. 本番運用時の必須セキュリティ対策
+
+### 8.1 ート制限のストレージ（Redis推奨）
+
+開発環境では `memory://` で動作しますが、本番でGunicornなどで複数ワーカーを立ち上げた場合、プロセス間でカウンターが共有されず、レート制限が事実上無効化されてしまいます。
+
+**対策:**
+
+```bash
+# Redisをインストール・起動した上で
+python -m pip install redis
+```
+
+そして環境変数を設定:
+
+```bash
+export LIMITER_STORAGE="redis://localhost:6379/0"
+```
+
+これでどのワーカーがリクエストを処理しても、正確にリクエスト数がカウント・制限されるようになります。
+
+### 8.2 HTTPSの強制
+
+リバースプロキシ（Nginx等）の背後で動かす場合は `FLASK_HTTPS=true` を設定して、Cookieの `Secure` 属性を有効にしてください。
+
+```bash
+export FLASK_HTTPS=true
+```
+
+---
+
+## 9. まとめ
+
+今回の修正案を反映した完全版により、Pastebinは以下の3つの顔を持つようになりました。
+
+1. **人間向け**: ブラウザからCSRF対策フォームで安全にコードを共有
+2. **機械向け（汎用API）**: APIキー認証でCI/CDや監視スクリプトから自動投稿
+3. **外部サービス向け（Webhook）**: 署名検証でGitHub等からの自動連携を安全に受信
+
+APIキーとWebhookシークレットを分離したことで、万が一どちらかが漏洩しても、もう一方の認証は守られる、 defense in depth（深層防御）の設計になっています。
+
+---
+
+## 10. 次のステップ: TTL（自動有効期限）機能の予告
+
+さらに機能を拡張するなら、**自動有効期限（TTL）機能**が非常に実用的です。
+
+### なぜ `os.path.getmtime()` ではダメなのか
+
+`mtime`（最終更新時刻）はファイルのコピー・移動・バックアップからの復元で値が変わってしまいます。期限切れのはずの paste が「まだ有効」に見えてしまう事故を防ぐため、期限切れ時刻は **ファイル内に明示的に保存** する方針が正解です。
+
+### ファイルフォーマットの拡張
+
+既存の `言語\n本文` を拡張し、2行目に Unixtime の期限切れ時刻を入れます。期限なしの場合は `0` を書きます。
+
+```
+python
+1699300000
+print("Hello, TTL!")
+```
+
+### 実装スケッチ
+
+```python
+import time
+from typing import Optional, Tuple
+
+
+def read_paste_with_ttl(paste_id: str) -> Tuple[str, str]:
+    """
+    ファイルを読み込み、(language, content) を返す。
+    期限切れなら 404 を送出する。
+    ファイル形式が壊れていても ValueError をキャッチして 404 にする。
+    """
+    file_path = os.path.join(PASTE_DIR, paste_id)
+    if not os.path.isfile(file_path):
+        abort(404)
+
+    try:
+        with open(file_path, "r", encoding="utf-8", newline="\n") as f:
+            language = f.readline().rstrip("\n")
+            expires_line = f.readline().rstrip("\n")
+            content = f.read()
+    except (OSError, UnicodeError):
+        abort(404)
+
+    # 期限チェック
+    try:
+        expires_at = int(expires_line)
+    except ValueError:
+        abort(404)  # 壊れたファイルは存在しないものとして扱う
+
+    if expires_at != 0 and time.time() > expires_at:
+        # 期限切れ: ファイルを削除して 404 を返す（クリーンアップ）
+        try:
+            os.remove(file_path)
+        except OSError:
+            pass
+        abort(404)
+
+    return sanitize_language(language), content
+
+
+def save_paste_with_ttl(
+    content: str, language: str, expires_in: Optional[int] = None
+) -> str:
+    """
+    TTL 対応版の保存関数。
+    expires_in が None なら期限なし、秒数が指定されれば現在時刻 + expires_in を書き込む。
+    """
+    language = sanitize_language(language)
+    content = content.replace("\r\n", "\n").replace("\r", "\n")
+
+    if not content:
+        abort(400, description="Content is required.")
+
+    content_bytes = content.encode("utf-8")
+    if len(content_bytes) > MAX_PASTE_BYTES:
+        abort(413, description="Payload too large.")
+
+    # 期限切れ時刻を計算 (0 = 期限なし)
+    expires_at = 0
+    if expires_in is not None and expires_in > 0:
+        expires_at = int(time.time()) + expires_in
+
+    try:
+        paste_id, file_path, file_object = create_paste_file()
+        try:
+            file_object.write(language + "\n")
+            file_object.write(str(expires_at) + "\n")
+            file_object.write(content)
+            file_object.flush()
+            os.fsync(file_object.fileno())
+        except Exception:
+            file_object.close()
+            try:
+                os.remove(file_path)
+            except OSError:
+                pass
+            raise
+        finally:
+            file_object.close()
+
+        logging.info("Created paste: %s (expires_at=%s)", paste_id, expires_at)
+        return paste_id
+
+    except RuntimeError:
+        logging.exception("Failed to create paste.")
+        abort(500, description="Unable to create paste.")
+    except OSError:
+        logging.exception("Failed to write paste.")
+        abort(500, description="Unable to save paste.")
+```
+
+### ポイント
+
+- **明示的な期限保存**: `mtime` に依存せず、ファイル内の Unixtime で期限を管理
+- **自己クリーンアップ**: 閲覧時に期限切れを検出したら即座にファイルを削除
+- **壊れたファイルへの耐性**: `ValueError` をキャッチして `404` にすることで、改竄や中途半端な書き込みに対して安全
+- **期限なしとの区別**: `expires_at = 0` を「期限なし」のマーカーとして使う
+
+この設計なら、閲覧時に都度チェックするだけでなく、cron で定期的に `pastes/` ディレクトリを走査して期限切れファイルを一掃するスクリプトも書けます。ファイルシステムベースでも、メタデータをファイル内に明示的に保存することで、データベース並みの堅牢性を実現できるんやで。
