@@ -46,7 +46,7 @@ SQLiteに本文も保存できますが、この構成では**メタデータの
 
 * **SQLiteのBLOBは大きなテキストに向かない** — 数KB以上のテキストを大量に保存するとデータベースファイルが肥大化
 * **ファイルの方がシンプル** — 本文の読み書きはファイルの方が高速でシンプル
-* **バックアップの分離** — メタデータと本文を別々にバックアップできる
+* **バックアップの分離** — メタデータと本文を別々にバックアップできる（手順は 11.5）
 * **責務の分離** — SQLiteは「管理情報」、ファイルは「本文」という明確な分離
 
 つまり、以下の役割分担になります。
@@ -224,7 +224,7 @@ SQLiteには日時専用の型がありません。日時の保存方法には�
 * データベースファイルが漏洩した場合、すべてのPasteの削除トークンが流出
 * バックアップファイルから削除トークンが復元可能
 
-SHA-256でハッシュ化して保存することで、たとえデータベースが漏洩しても、元のトークンを直接知ることは困難になります。ただし、SHA-256そののが安全なのではなく、`secrets.token_urlsafe(16)` で生成された十分にランダムなトークンに対しては、総当たりによる逆算が現実的ではない、という点が重要です。もしトークンが短かったり、予測可能なパターン（連番など）だったりすると、SHA-256でも総当たりで元のトークンを見つけ出すことが可能です。十分なエントロピー（ランダム性）を持つトークンを使うことが前提となります。
+SHA-256でハッシュ化して保存することで、たとえデータベースが漏洩しても、元のトークンを直接知ることは困難になります。ただし、SHA-256そのものが安全なのではなく、`secrets.token_urlsafe(16)` で生成された十分にランダムなトークンに対しては、総当たりによる逆算が現実的ではない、という点が重要です。もしトークンが短かったり、予測可能なパターン（連番など）だったりすると、SHA-256でも総当たりで元のトークンを見つけ出すことが可能です。十分なエントロピー（ランダム性）を持つトークンを使うことが前提となります。
 
 検証時には「受け取ったトークンをハッシュ化して、保存されたハッシュと比較」します。
 
@@ -349,7 +349,9 @@ def get_db():
         # isolation_level=None: manual transaction management.
         # This avoids conflict between explicit BEGIN and Python sqlite3's
         # implicit transaction handling.
-        conn = sqlite3.connect(DATABASE_PATH, timeout=10.0, isolation_level=None)
+        # The lock-wait time is set only by "PRAGMA busy_timeout" below
+        # (connect(timeout=...) would set the same value and be overridden).
+        conn = sqlite3.connect(DATABASE_PATH, isolation_level=None)
         conn.row_factory = sqlite3.Row
         # Enable WAL mode for better concurrent read/write performance
         conn.execute("PRAGMA journal_mode=WAL").fetchone()
@@ -586,8 +588,8 @@ def remove_paste_file(paste_id):
 # ============================================================
 
 def normalize_newlines(text):
-    """Normalize CRLF to LF before saving."""
-    return text.replace("\r\n", "\n")
+    """Normalize CRLF and CR to LF before saving."""
+    return text.replace("\r\n", "\n").replace("\r", "\n")
 
 
 def create_paste(content, language, expires_at=None):
@@ -833,12 +835,14 @@ def view_paste(paste_id):
     if not row:
         return error_response("Paste not found.", 404)
 
+    # Read the file first. If it is missing, return 404 without counting a view.
+    content = read_paste_file(paste_id)
+
     # Atomically increment and get the updated view count
     view_count = increment_view_count(paste_id)
     if view_count is None:
         return error_response("Paste not found.", 404)
 
-    content = read_paste_file(paste_id)
     language = sanitize_language(row["language"])
 
     try:
@@ -884,11 +888,11 @@ def raw_paste(paste_id):
     if not row:
         return error_response("Paste not found.", 404)
 
+    content = read_paste_file(paste_id)
+
     view_count = increment_view_count(paste_id)
     if view_count is None:
         return error_response("Paste not found.", 404)
-
-    content = read_paste_file(paste_id)
 
     response = app.response_class(
         content,
@@ -998,11 +1002,11 @@ def api_get_paste(paste_id):
     if not row:
         return api_error("Paste not found.", 404)
 
+    content = read_paste_file(paste_id)
+
     view_count = increment_view_count(paste_id)
     if view_count is None:
         return api_error("Paste not found.", 404)
-
-    content = read_paste_file(paste_id)
 
     return jsonify({
         "paste_id": paste_id,
@@ -1102,15 +1106,31 @@ if __name__ == "__main__":
 ```python
 def get_db():
     if "db" not in g:
-        conn = sqlite3.connect(DATABASE_PATH, timeout=10.0)
+        # isolation_level=None: manual transaction management.
+        # This avoids conflict between explicit BEGIN and Python sqlite3's
+        # implicit transaction handling.
+        # The lock-wait time is set only by "PRAGMA busy_timeout" below
+        # (connect(timeout=...) would set the same value and be overridden).
+        conn = sqlite3.connect(DATABASE_PATH, isolation_level=None)
         conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
+        # Enable WAL mode for better concurrent read/write performance
+        conn.execute("PRAGMA journal_mode=WAL").fetchone()
         conn.execute("PRAGMA busy_timeout=5000")
         g.db = conn
     return g.db
 ```
 
 Flaskの `g` オブジェクトは、**リクエスト単位**のグローバル名前空間です。同じリクエスト内で複数回 `get_db()` を呼んでも、新しい接続が作られるのは最初の1回だけです。
+
+#### isolation_level=None
+
+`isolation_level=None` は、自動コミット（autocommit）モードにする指定です。Pythonの `sqlite3` モジュールは、通常、`INSERT` などの前に暗黙でトランザクションを開始します。この動作を止めて、`BEGIN IMMEDIATE`・`commit()`・`rollback()` を自分で制御します（7.7 の `create_paste()` で使います）。
+
+#### ロック待ち時間の指定は1か所にする
+
+`sqlite3.connect()` の `timeout` 引数と `PRAGMA busy_timeout` は、どちらも同じ「ロック待ち時間」を設定します。両方を指定すると、後から実行した方で上書きされます（`timeout=10.0` のあとに `busy_timeout=5000` を実行すると、実効値は5秒です）。
+
+このコードでは、待ち時間を `PRAGMA busy_timeout` だけで指定します。
 
 #### WALモードとbusy_timeout
 
@@ -1240,17 +1260,24 @@ datetime.now(timezone.utc).isoformat()  # 2024-01-15T08:30:00+00:00
 
 ```python
 def increment_view_count(paste_id):
+    """
+    Increment view count and return the updated value.
+    Uses RETURNING clause to get the new value atomically.
+    Skips increment for HEAD requests.
+    Returns None if the paste no longer exists (deleted by another request).
+    """
     if request.method == "HEAD":
         row = get_paste_from_db(paste_id)
-        return row["view_count"] if row else 0
+        return row["view_count"] if row else None
 
     db = get_db()
     row = db.execute(
-        "UPDATE pastes SET view_count = view_count + 1 WHERE paste_id = ? RETURNING view_count",
+        "UPDATE pastes SET view_count = view_count + 1 "
+        "WHERE paste_id = ? RETURNING view_count",
         (paste_id,),
     ).fetchone()
     db.commit()
-    return row["view_count"] if row else 0
+    return row["view_count"] if row else None
 ```
 
 このアプリケーションでは、以下のすべてのエンドポイントで閲覧時に `increment_view_count()` が呼ばれます。
@@ -1263,9 +1290,20 @@ def increment_view_count(paste_id):
 
 これは意図的な仕様です。いずれの方法でPasteにアクセスしても、閲覧としてカウントされます。
 
-`UPDATE pastes SET view_count = view_count + 1` は、データベース側で現在値に1を加算する方式です。Python側で現在値を読み込んで `+1` して書き戻す方式と比べて、同時アクセス時の競合に対してより安全です
+`UPDATE pastes SET view_count = view_count + 1` は、データベース側で現在値に1を加算する方式です。Python側で現在値を読み込んで `+1` して書き戻す方式と比べて、同時アクセス時の競合に対してより安全です。
 
 さらに `RETURNING view_count` 句を使うことで、UPDATEと同じトランザクション内で更新後の値を取得します。これにより、同時アクセス時でも正確な更新後の値を返せます。
+
+#### 加算するタイミング
+
+ルートの中では、**ファイルの読み込みに成功してから**閲覧数を加算します。
+
+```python
+content = read_paste_file(paste_id)          # 失敗すると404
+view_count = increment_view_count(paste_id)  # 読めた場合だけ加算
+```
+
+以前は「加算してからファイルを読む」順だったため、ファイルが無くて404を返すときにも閲覧数が増えていました。
 
 #### HEADリクエストの扱い
 
@@ -1282,19 +1320,23 @@ def increment_view_count_fallback(paste_id):
     db.execute("UPDATE pastes SET view_count = view_count + 1 WHERE paste_id = ?", (paste_id,))
     db.commit()
     row = db.execute("SELECT view_count FROM pastes WHERE paste_id = ?", (paste_id,)).fetchone()
-    return row["view_count"] if row else 0
+    return row["view_count"] if row else None
 ```
 
 ### 7.6 改行コードの正規化
 
 ```python
 def normalize_newlines(text):
-    return text.replace("\r\n", "\n")
+    """Normalize CRLF and CR to LF before saving."""
+    return text.replace("\r\n", "\n").replace("\r", "\n")
 ```
 
 ブラウザの `textarea` は、Windows環境では `CRLF`（`\r\n`）で改行を送信することがあります。これをそのまま保存すると、`/raw` で `\r\n` がそのまま出力され、想定と異なる表示になる可能性があります。
 
 保存前に `CRLF` を `LF` に正規化することで、改行コードを一貫した形式で保存します。
+
+単独の `CR`（`\r`）も `LF` に変換します。ファイルを読み込むとき、Pythonのテキストモードは `\r` を `\n` に変換します。`\r` を残したまま保存すると、保存した内容と、読み出した内容が食い違ってしまいます。
+変換は、`\r\n` を先に行います。先に `\r` だけを変換すると、`\r\n` が改行2つになってしまうためです。
 
 ### 7.7 Paste作成時の補償処理
 
@@ -1558,6 +1600,8 @@ def get_active_paste(paste_id):
     """
     Return the DB row of a paste that may be shown, or None.
     None means: invalid ID, no such paste, or the paste has expired.
+
+    Every route that reads a paste must call this first.
     """
     if not is_valid_paste_id(paste_id):
         return None
@@ -1784,7 +1828,7 @@ Flaskアプリケーション内にクリーンアップ処理を組み込む方
 | ファイル削除失敗 → DB削除成功 → commit成功 | DBにないがファイルが残る（孤立ファイル）→ 不整合 |
 | ファイル削除成功 → DB削除成功 → commit失敗 | ファイルがないがDBレコードが残る → 不整合 |
 
-これらの不整合は、DBとファイルを分離しているアーキテクチャでは避けられません。`cleanup_orphan_files()` 関を定期的に実行することで、孤立ファイルを検出・削除できます。
+これらの不整合は、DBとファイルを分離しているアーキテクチャでは避けられません。`cleanup_orphan_files()` 関数を定期的に実行することで、孤立ファイルを検出・削除できます。
 
 #### 孤立ファイルの削除とPaste作成の競合
 
@@ -2425,6 +2469,46 @@ export FLASK_HTTPS=true
 python app.py
 ```
 
+### 11.5 バックアップ
+
+バックアップの対象は、`pastes.db`（メタデータ）と `pastes/`（本文）の2つです。
+
+#### pastes.db は、ファイルをコピーするだけでは不十分
+
+このアプリはWALモード（7.1）で動くため、実行中は `pastes.db-wal` と `pastes.db-shm` というファイルが作られます。コミット済みのデータは、まず `pastes.db-wal` に書かれ、あとで `pastes.db` に反映（チェックポイント）されます。
+
+そのため、アプリの実行中に `pastes.db` だけをコピーすると、まだ反映されていない最近のデータが、コピーに含まれないことがあります。
+
+SQLiteの `backup()` を使うと、実行中でも整合性のあるコピーを取れます。
+
+```python
+import sqlite3
+
+src = sqlite3.connect("pastes.db")
+dst = sqlite3.connect("backup/pastes.db")
+with dst:
+    src.backup(dst)
+dst.close()
+src.close()
+```
+
+#### コピーの順序
+
+**DBを先にバックアップし、そのあとで `pastes/` をコピーします。**
+
+```bash
+python backup_db.py          # 上のコードを backup_db.py として保存したもの
+cp -r pastes/ backup/pastes/
+```
+
+順序を逆にすると、コピー中に作られたPasteが「DBにはレコードがあるが、ファイルがない」状態でバックアップに入ります。復元後、そのPasteは閲覧できません（404）。
+
+順序が「DB → ファイル」なら、ファイルはあるがDBにレコードがない孤立ファイルになるだけです。孤立ファイルは `cleanup_orphan_files()`（8章）が後で削除します。
+
+#### 復元するとき
+
+アプリケーションを停止し、`pastes.db` と `pastes/` を元の場所に戻します。このとき、古い `pastes.db-wal` と `pastes.db-shm` が残っていれば削除してから、`pastes.db` を置いてください。WALファイルは特定のデータベースと対になっているため、別のバックアップの `pastes.db` と組み合わせると、データが壊れることがあります。
+
 ---
 
 ## 12. APIの使い方
@@ -2474,7 +2558,7 @@ APIの **作成（POST）** と **削除（DELETE）** には `X-API-Key` ヘッ
 
 #### 注意：API GET での閲覧数
 
-API GET も閲覧数をインクリメントします。認証なしでアクセスできるため、第三者が繰り返しリクエストすることで閲覧数を水増しできる可能性があります。これはレートリミット未実装の現状では防ぎきれませんAPIルートへのレートリミット導入を検討してください。
+API GET も閲覧数をインクリメントします。認証なしでアクセスできるため、第三者が繰り返しリクエストすることで閲覧数を水増しできる可能性があります。これはレートリミット未実装の現状では防ぎきれません。APIルートへのレートリミット導入を検討してください。
 
 ---
 
@@ -2861,9 +2945,9 @@ shortuuidはUUIDをBase57エンコーディングした文字列を生成しま�
 57^10 ≈ 3.6 × 10^17
 ```
 
-これは約360京（360 quadrillion）通りです。実用上、衝突の確率は無視できるレベルですが、理論的には可能性があるため、衝突時の再試行処理を入れています。
+これは約36京（英語では約360 quadrillion）通りです。実用上、衝突の確率は無視できるレベルですが、理論的には可能性があるため、衝突時の再試行処理を入れています。
 
-`shortuuid` は内部で `secrets.token_bytes()` を使用しており、暗号論的に安全な乱数源を使っています。
+`shortuuid.random()` は、Pythonの `secrets` モジュール（`secrets.choice()`）で1文字ずつ選ぶため、暗号論的に安全な乱数源を使っています。
 
 ---
 
