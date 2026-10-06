@@ -12,14 +12,14 @@
 
 ### 新規・強化されたAPI機能
 
-* **認証方式の分離** — 汎用APIキー (`X-API-Key`) と GitHub Webhook署名検証 (`X-Hub-Signature-256`) を独立した環境変数で管理
-* **マルチパターン認証** — 1つのエンドポイントで「内部スクリプトからのAPI利用」と「外部サービスからのWebhook受信」の両方を安全に処理
-* **GitHub Webhook対応** — ペイロードの署名検証に対応し、送信元の真正性を担保
+- **認証方式の分離** — 汎用APIキー (`X-API-Key`) と GitHub Webhook署名検証 (`X-Hub-Signature-256`) を独立した環境変数で管理
+- **マルチパターン認証** — 1つのエンドポイントで「内部スクリプトからのAPI利用」と「外部サービスからのWebhook受信」の両方を安全に処理
+- **GitHub Webhook対応** — ペイロードの署名検証に対応し、送信元の真正性を担保。Webhook 作成時に送られる `ping` イベントにも正しく応答します
 
 ### アーキテクチャの改善
 
-* **セキュアバイデフォルト** — API用環境変数が未設定の場合、APIエンドポイントは自動的に `403 Forbidden` で無効化
-* **レート制限の統合** — `Flask-Limiter` を組み込み、APIの過剰利用を防止（本番ではRedisストレージを推奨）
+- **セキュアバイデフォルト** — API用環境変数が未設定の場合、APIエンドポイントは自動的に `403 Forbidden` で無効化
+- **レート制限の統合** — `Flask-Limiter` を組み込み、APIの過剰利用を防止（本番ではRedisストレージを推奨）
 
 ---
 
@@ -30,7 +30,7 @@ pastebin/
 ├── app.py              <- Webhook対応版のFlaskアプリケーション
 ├── requirements.txt    <- 必要なパッケージ一覧
 ├── pastes/             <- 投稿されたテキストの保存先 (自動作成)
-├── templates/          
+├── templates/
 │   ├── index.html      <- 投稿フォームと表示画面
 │   ├── 404.html        <- エラーページ
 │   └── 413.html        <- サイズ超過エラーページ
@@ -95,6 +95,7 @@ from flask_limiter.util import get_remote_address
 from pygments import highlight
 from pygments.formatters import HtmlFormatter
 from pygments.lexers import ClassNotFound, get_all_lexers, get_lexer_by_name
+from werkzeug.exceptions import HTTPException
 
 app = Flask(__name__)
 
@@ -139,6 +140,8 @@ logging.basicConfig(
 # Rate Limiting
 # ============================================================
 # 開発環境では memory:// で十分ですが、本番では redis:// を使ってください
+# 注意: デフォルト制限 (200/day, 50/hour) もAPIに適用されるため、
+# 実効上限は min(10/min, 50/hour, 200/day) = 1時間あたり最大50件です。
 limiter = Limiter(
     get_remote_address,
     app=app,
@@ -193,7 +196,9 @@ def verify_csrf_token(token):
     expected = session.get("csrf_token")
     if not token or not expected:
         return False
-    return secrets.compare_digest(token.encode("utf-8"), expected.encode("utf-8"))
+    return secrets.compare_digest(
+        token.encode("utf-8"), expected.encode("utf-8")
+    )
 
 
 # ============================================================
@@ -277,11 +282,11 @@ def index():
         try:
             paste_id = save_paste_content(content, language)
             return redirect(url_for("view_paste", paste_id=paste_id))
-        except Exception as e:
-            # abort(413) なはここでキャッチして専用ページへ
-            if hasattr(e, 'code') and e.code == 413:
-                abort(413)
-
+        except HTTPException:
+            # abort() (400/413/500 など) はそのままエラーハンドラへ委譲
+            raise
+        except Exception:
+            logging.exception("Failed to create paste via form.")
             flash("Error creating paste.", "error")
             return render_template(
                 "index.html",
@@ -301,15 +306,25 @@ def index():
 def api_create_paste():
     # 1. APIが環境変数で有効化されているか確認
     if not API_ENABLED:
+        # 403 = サーバ側の設定による無効化 (クライアントの責ではない)
         abort(403, description="API is disabled by server configuration.")
+
+    # GitHub の Webhook 作成時に送られる疎通確認 (ping) には即応答する。
+    # ここで 400 を返すと GitHub 側で配信失敗と表示されてしまう。
+    if request.headers.get("X-GitHub-Event") == "ping":
+        return jsonify({"status": "pong"}), 200
 
     is_authorized = False
 
     # パターンA: 汎用APIキーによる認証
     api_key = request.headers.get("X-API-Key")
-    if PASTEBIN_API_KEY and api_key and secrets.compare_digest(api_key, PASTEBIN_API_KEY):
-        is_authorized = True
-        logging.info("Authorized via API Key.")
+    if PASTEBIN_API_KEY and api_key:
+        # バイト列同士で比較 (str 同士だと非ASCIIで TypeError になる)
+        if secrets.compare_digest(
+            api_key.encode("utf-8"), PASTEBIN_API_KEY.encode("utf-8")
+        ):
+            is_authorized = True
+            logging.debug("Authorized via API Key.")
 
     # パターンB: GitHub Webhookの署名検証による認証
     if not is_authorized and GITHUB_WEBHOOK_SECRET:
@@ -323,12 +338,13 @@ def api_create_paste():
 
             if secrets.compare_digest(signature, expected_sig):
                 is_authorized = True
-                logging.info("Authorized via GitHub Webhook signature.")
+                logging.debug("Authorized via GitHub Webhook signature.")
 
     if not is_authorized:
+        # 401 = クライアントの認証情報が無効
         abort(401, description="Invalid credentials or signature.")
 
-    # 3. JSONリクエストの検証
+    # 2. JSONリクエストの検証
     if not request.is_json:
         abort(400, description="Content-Type must be application/json.")
 
@@ -342,7 +358,9 @@ def api_create_paste():
     # GitHub Webhookの場合、ペイロードからcontentを抽出する例
     # 通常のAPI利用時は上記でcontentが取得できる
     if not content and request.headers.get("X-GitHub-Event"):
-        commits = data.get("commits", [])
+        commits = data.get("commits") or []
+        if not isinstance(commits, list):
+            commits = []
         if commits:
             content = "\n\n".join([
                 f"Commit by {c.get('author', {}).get('name', 'Unknown')}:\n"
@@ -355,10 +373,10 @@ def api_create_paste():
     if not isinstance(content, str):
         abort(400, description="'content' must be a string.")
 
-    # 4. 保存処理 (共通関数を使用)
+    # 3. 保存処理 (共通関数を使用)
     paste_id = save_paste_content(content, language)
 
-    # 5. 成功レスポンス
+    # 4. 成功レスポンス
     return jsonify({
         "status": "success",
         "paste_id": paste_id,
@@ -386,11 +404,11 @@ def view_paste(paste_id):
     language = sanitize_language(language)
     try:
         lexer = get_lexer_by_name(language)
-        highlighted = highlight(content, lexer, HtmlFormatter(linenos=True, cssclass="highlight"))
-        highlight_css = HtmlFormatter(linenos=True, cssclass="highlight").get_style_defs(".highlight")
     except ClassNotFound:
-        highlighted = highlight(content, get_lexer_by_name("text"), HtmlFormatter(linenos=True, cssclass="highlight"))
-        highlight_css = HtmlFormatter(linenos=True, cssclass="highlight").get_style_defs(".highlight")
+        lexer = get_lexer_by_name("text")
+    formatter = HtmlFormatter(linenos=True, cssclass="highlight")
+    highlighted = highlight(content, lexer, formatter)
+    highlight_css = formatter.get_style_defs(".highlight")
 
     return render_template(
         "index.html",
@@ -480,6 +498,10 @@ def internal_error(error):
 # Main
 # ============================================================
 if __name__ == "__main__":
+    # 本番では gunicorn/uvicorn 等のWSGIサーバを使い、
+    # リバースプロキシ (Nginx等) を挟む場合は ProxyFix を有効化してください。
+    # from werkzeug.middleware.proxy_fix import ProxyFix
+    # app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1)
     app.run(debug=False, host="127.0.0.1", port=5000)
 ```
 
@@ -507,7 +529,9 @@ $env:GITHUB_WEBHOOK_SECRET = "my-github-webhook-secret"
 python app.py
 ```
 
-> **セキュアバイデフォルト**: `PASTEBIN_API_KEY` も `GITHUB_WEBHOOK_SECRET` も設されていない場合、APIエンドポイントは `403 Forbidden` を返して完全に無効化されます。設定ミスによる事故防止になっています。
+> **セキュアバイデフォルト**: `PASTEBIN_API_KEY` も `GITHUB_WEBHOOK_SECRET` も設定されていない場合、APIエンドポイントは `403 Forbidden` を返して完全に無効化されます。設定ミスによる事故防止になっています。
+
+> **レート制限の実効上限**: デフォルト制限 (`200/day`, `50/hour`) と API 制限 (`10/minute`) が**両方とも**適用されます。そのため実効的な上限は `1時間あたり最大50件` です。内部ツールの利用頻度に応じて `default_limits` や `@limiter.limit` の値を調整してください。また、GitHub Webhook の連続イベント (push のバースト等) で 429 が返る可能性がある場合は、Webhook 経路の制限を緩くする等の調整が必要です。
 
 ---
 
@@ -522,7 +546,7 @@ curl -X POST http://127.0.0.1:5000/api/v1/paste \
   -d '{"content": "print(\"Hello from API!\")", "language": "python"}'
 ```
 
-**レスンス:**
+**レスポンス:**
 
 ```json
 {
@@ -533,7 +557,17 @@ curl -X POST http://127.0.0.1:5000/api/v1/paste \
 }
 ```
 
-### 6.2 エラーパターン
+### 6.2 GitHub Webhook からの投稿
+
+GitHub リポジトリの Settings → Webhooks で以下を設定します。
+
+- **Payload URL**: `http://<あなたのサーバ>/api/v1/paste`
+- **Content type**: `application/json`
+- **Secret**: `GITHUB_WEBHOOK_SECRET` と同じ値
+
+作成時に送られる `ping` イベントには `{"status": "pong"}` が返り、GitHub 側で「緑のチェックマーク」がつきます。
+
+### 6.3 エラーパターン
 
 **APIキーが間違っている:**
 
@@ -542,6 +576,8 @@ curl -X POST ... -H "X-API-Key: wrong-key" ...
 ```
 
 **レスポンス:** `401 Unauthorized` と `{"error": "Invalid credentials or signature."}`
+
+> 401 (認証情報が無効) と 403 (サーバ側でAPIが無効化されている) は意味が異なります。トラブルシュート時の見分けに使ってください。
 
 **サイズ超過:**
 
@@ -554,9 +590,43 @@ curl -X POST ... -H "X-API-Key: wrong-key" ...
 CI/CDパイプラインや監視スクリプトから使う場合の例です。
 
 ```python
+import sys
+
 import requests
 
 WEBHOOK_URL = "http://127.0.0.1:5000/api/v1/paste"
 API_KEY = "my-super-secret-api-key-12345"
 
-log_data = 
+def post_paste(content: str, language: str = "text") -> str:
+    """テキストをPastebinに投稿し、ブラウザで開けるURLを返す。"""
+    response = requests.post(
+        WEBHOOK_URL,
+        headers={
+            "Content-Type": "application/json",
+            "X-API-Key": API_KEY,
+        },
+        json={"content": content, "language": language},
+        timeout=10,
+    )
+    response.raise_for_status()  # 401/413 等はここで例外化
+    data = response.json()
+    print(f"Paste created: {data['url']}")
+    return data["url"]
+
+
+if __name__ == "__main__":
+    # 例: ログファイルやコマンド出力を丸ごと貼り付ける
+    content = sys.stdin.read()
+    if not content.strip():
+        print("No input received.", file=sys.stderr)
+        sys.exit(1)
+    post_paste(content, language="text")
+```
+
+使い方:
+
+```bash
+# コマンド出力をパイプでそのまま投稿
+$ some-command --verbose | python post_paste.py
+Paste created: http://127.0.0.1:5000/paste/xY3zA9QbLm
+```
