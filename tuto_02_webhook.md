@@ -12,7 +12,7 @@
 
 ### 新規・強化されたAPI機能
 
-- **認証方式の分離** — 汎用APIキー (`X-API-Key`) と GitHub Webhook署名検証 (`X-Hub-Signature-256`) を独立した環境変数で理
+- **認証方式の分離** — 汎用APIキー (`X-API-Key`) と GitHub Webhook署名検証 (`X-Hub-Signature-256`) を独立した環境変数で管理
 - **マルチパターン認証** — 1つのエンドポイントで「内部スクリプトからのAPI利用」と「外部サービスからのWebhook受信」の両方を安全に処理
 - **GitHub Webhook対応** — ペイロードの署名検証に対応し、送信元の真正性を担保。Webhook 作成時に送られる `ping` イベントにも正しく応答します
 
@@ -20,6 +20,7 @@
 
 - **セキュアバイデフォルト** — API用環境変数が未設定の場合、APIエンドポイントは自動的に `403 Forbidden` で無効化
 - **レート制限の統合** — `Flask-Limiter` を組み込み、APIの過剰利用を防止（本番ではRedisストレージを推奨）
+- **リバースプロキシ対応** — Nginx等の背後でも、利用者ごとにレート制限を掛けられる（環境変数 `TRUSTED_PROXY_COUNT`）
 
 ---
 
@@ -96,6 +97,7 @@ from pygments import highlight
 from pygments.formatters import HtmlFormatter
 from pygments.lexers import ClassNotFound, get_all_lexers, get_lexer_by_name
 from werkzeug.exceptions import HTTPException
+from werkzeug.middleware.proxy_fix import ProxyFix
 
 app = Flask(__name__)
 
@@ -116,6 +118,26 @@ GITHUB_WEBHOOK_SECRET = os.environ.get("GITHUB_WEBHOOK_SECRET")
 
 # どちらかが設定されていればAPIエンドポイントを有効化
 API_ENABLED = bool(PASTEBIN_API_KEY or GITHUB_WEBHOOK_SECRET)
+
+# リバースプロキシ (Nginx等) の背後で動かす場合に、プロキシの段数を指定する。
+# 0 (既定) の場合は X-Forwarded-* ヘッダーを信用しない。
+# プロキシがないのに 1 以上にすると、クライアントがヘッダーを偽装して
+# レート制限を回避できてしまうので注意。
+try:
+    TRUSTED_PROXY_COUNT = int(os.environ.get("TRUSTED_PROXY_COUNT", "0"))
+except ValueError:
+    raise RuntimeError("TRUSTED_PROXY_COUNT must be an integer.")
+if TRUSTED_PROXY_COUNT < 0:
+    raise RuntimeError("TRUSTED_PROXY_COUNT must not be negative.")
+
+if TRUSTED_PROXY_COUNT > 0:
+    # import 時に適用する (gunicorn では `if __name__ == "__main__"` は実行されない)
+    app.wsgi_app = ProxyFix(
+        app.wsgi_app,
+        x_for=TRUSTED_PROXY_COUNT,
+        x_proto=TRUSTED_PROXY_COUNT,
+        x_host=TRUSTED_PROXY_COUNT,
+    )
 
 MAX_PASTE_BYTES = 512 * 1024
 app.config["MAX_CONTENT_LENGTH"] = MAX_PASTE_BYTES * 3 + 16 * 1024
@@ -139,15 +161,22 @@ logging.basicConfig(
 # ============================================================
 # Rate Limiting
 # ============================================================
-# 開発環境では memory:// で十分ですが、本番では redis:// を使ってください
-# 注意: デフォルト制限 (200/day, 50/hour) もAPIに適用されるため、
-# 実効上限は min(10/min, 50/hour, 200/day) = 1時間あたり最大50件です。
+# 開発環境では memory:// で十分ですが、本番では redis:// を使ってください。
+#
+# default_limits: 制限を指定していないルート (閲覧など) すべてに適用される。
+#   ブラウザでの通常の利用を妨げない、ゆるめの値にしておく。
+# @limiter.limit(...): 書き込みのルートに、より厳しい制限を追加する。
+#   override_defaults=False を付けない場合、そのルートでは default_limits が
+#   置き換えられて適用されなくなるため、ここでは False を指定する。
 limiter = Limiter(
     get_remote_address,
     app=app,
-    default_limits=["200 per day", "50 per hour"],
+    default_limits=["1000 per day", "200 per hour"],
     storage_uri=os.environ.get("LIMITER_STORAGE", "memory://"),
 )
+
+API_RATE_LIMIT = "10 per minute;50 per hour"
+FORM_RATE_LIMIT = "10 per minute;30 per hour"
 
 # ============================================================
 # Validation & Helpers
@@ -179,6 +208,47 @@ def sanitize_language(language):
     return language if language in ALLOWED_LANGUAGES else "text"
 
 
+def validate_content_size(content):
+    """UTF-8 にエンコードできること、サイズ上限以内であることを確認する。"""
+    try:
+        content_bytes = content.encode("utf-8")
+    except UnicodeEncodeError:
+        # JSON の "\ud800" のような孤立サロゲートは UTF-8 にできない
+        abort(400, description="Content contains invalid Unicode characters.")
+
+    if len(content_bytes) > MAX_PASTE_BYTES:
+        abort(413, description="Payload too large.")
+
+
+def format_push_commits(commits):
+    """GitHub の push イベントの commits を、貼り付け用のテキストにする。"""
+    if not isinstance(commits, list):
+        return ""
+
+    entries = []
+    for commit in commits:
+        if not isinstance(commit, dict):
+            continue
+        author = commit.get("author")
+        name = author.get("name") if isinstance(author, dict) else None
+        entries.append(
+            f"Commit by {name or 'Unknown'}:\n"
+            f"Message: {commit.get('message', '')}\n"
+            f"URL: {commit.get('url', '')}"
+        )
+    return "\n\n".join(entries)
+
+
+# ============================================================
+# Constant-time comparison
+# ============================================================
+
+
+def constant_time_equals(a, b):
+    """2つの文字列を一定時間で比較する。非ASCII文字が入っていても TypeError にならない。"""
+    return secrets.compare_digest(a.encode("utf-8"), b.encode("utf-8"))
+
+
 # ============================================================
 # CSRF (Browser Form Only)
 # ============================================================
@@ -196,9 +266,7 @@ def verify_csrf_token(token):
     expected = session.get("csrf_token")
     if not token or not expected:
         return False
-    return secrets.compare_digest(
-        token.encode("utf-8"), expected.encode("utf-8")
-    )
+    return constant_time_equals(token, expected)
 
 
 # ============================================================
@@ -233,9 +301,7 @@ def save_paste_content(content: str, language: str) -> str:
     if not content:
         abort(400, description="Content is required.")
 
-    content_bytes = content.encode("utf-8")
-    if len(content_bytes) > MAX_PASTE_BYTES:
-        abort(413, description="Payload too large.")
+    validate_content_size(content)
 
     try:
         paste_id, file_path, file_object = create_paste_file()
@@ -270,6 +336,7 @@ def save_paste_content(content: str, language: str) -> str:
 # ============================================================
 
 @app.route("/", methods=["GET", "POST"])
+@limiter.limit(FORM_RATE_LIMIT, methods=["POST"], override_defaults=False)
 def index():
     if request.method == "POST":
         csrf_token = request.form.get("csrf_token", "")
@@ -302,27 +369,20 @@ def index():
 
 
 @app.route("/api/v1/paste", methods=["POST"])
-@limiter.limit("10 per minute")  # APIはより厳しく制限
+@limiter.limit(API_RATE_LIMIT, override_defaults=False)  # APIはより厳しく制限
 def api_create_paste():
     # 1. APIが環境変数で有効化されているか確認
     if not API_ENABLED:
         # 403 = サーバ側の設定による無効化 (クライアントの責ではない)
         abort(403, description="API is disabled by server configuration.")
 
-    # GitHub の Webhook 作成時に送られる疎通確認 (ping) には即応答する。
-    # ここで 400 を返すと GitHub 側で配信失敗と表示されてしまう。
-    if request.headers.get("X-GitHub-Event") == "ping":
-        return jsonify({"status": "pong"}), 200
-
+    # 2. 認証 (GitHub の ping も含め、すべてのリクエストで最初に行う)
     is_authorized = False
 
     # パターンA: 汎用APIキーによる認証
     api_key = request.headers.get("X-API-Key")
     if PASTEBIN_API_KEY and api_key:
-        # バイト列同士で比較 (str 同士だと非ASCIIで TypeError になる)
-        if secrets.compare_digest(
-            api_key.encode("utf-8"), PASTEBIN_API_KEY.encode("utf-8")
-        ):
+        if constant_time_equals(api_key, PASTEBIN_API_KEY):
             is_authorized = True
             logging.debug("Authorized via API Key.")
 
@@ -336,7 +396,7 @@ def api_create_paste():
                 hashlib.sha256
             ).hexdigest()
 
-            if secrets.compare_digest(signature, expected_sig):
+            if constant_time_equals(signature, expected_sig):
                 is_authorized = True
                 logging.debug("Authorized via GitHub Webhook signature.")
 
@@ -344,7 +404,14 @@ def api_create_paste():
         # 401 = クライアントの認証情報が無効
         abort(401, description="Invalid credentials or signature.")
 
-    # 2. JSONリクエストの検証
+    github_event = request.headers.get("X-GitHub-Event")
+
+    # GitHub の Webhook 作成時に送られる疎通確認 (ping) には、認証のあとで即応答する。
+    # ここで 400 を返すと GitHub 側で配信失敗と表示されてしまう。
+    if github_event == "ping":
+        return jsonify({"status": "pong"}), 200
+
+    # 3. JSONリクエストの検証
     if not request.is_json:
         abort(400, description="Content-Type must be application/json.")
 
@@ -357,26 +424,23 @@ def api_create_paste():
 
     # GitHub Webhookの場合、ペイロードからcontentを抽出する例
     # 通常のAPI利用時は上記でcontentが取得できる
-    if not content and request.headers.get("X-GitHub-Event"):
-        commits = data.get("commits") or []
-        if not isinstance(commits, list):
-            commits = []
-        if commits:
-            content = "\n\n".join([
-                f"Commit by {c.get('author', {}).get('name', 'Unknown')}:\n"
-                f"Message: {c.get('message', '')}\n"
-                f"URL: {c.get('url', '')}"
-                for c in commits
-            ])
+    if not content and github_event:
+        if github_event != "push":
+            # push 以外のイベントは対象外。200 を返して、GitHub 側では配信成功にする。
+            return jsonify({"status": "ignored", "reason": "Unsupported event."}), 200
+
+        content = format_push_commits(data.get("commits"))
+        if not content:
+            return jsonify({"status": "ignored", "reason": "No commits in payload."}), 200
         language = "text"
 
     if not isinstance(content, str):
         abort(400, description="'content' must be a string.")
 
-    # 3. 保存処理 (共通関数を使用)
+    # 4. 保存処理 (共通関数を使用)
     paste_id = save_paste_content(content, language)
 
-    # 4. 成功レスポンス
+    # 5. 成功レスポンス
     return jsonify({
         "status": "success",
         "paste_id": paste_id,
@@ -443,13 +507,17 @@ def raw_paste(paste_id):
 
 
 # ============================================================
-# Error Handlers (Content Negotiation)
+# Error Handlers
 # ============================================================
 
 
 def is_api_request():
-    """リクエストがAPI/JSONを期待しているか判定する"""
-    return request.path.startswith("/api/") or request.accept_mimetypes.accept_json
+    """API のルートか判定する。
+
+    Accept ヘッダーで判定してはいけない。ブラウザの Accept には `*/*` が含まれ、
+    これが application/json にも一致するため、画面のエラーまで JSON になってしまう。
+    """
+    return request.path.startswith("/api/")
 
 
 @app.errorhandler(400)
@@ -487,6 +555,28 @@ def request_too_large(error):
     return render_template("413.html", max_bytes=MAX_PASTE_BYTES), 413
 
 
+@app.errorhandler(405)
+def method_not_allowed(error):
+    if is_api_request():
+        response = jsonify({"error": "Method not allowed."})
+    else:
+        response = app.make_response(
+            render_template("404.html", message="Method not allowed.")
+        )
+    response.status_code = 405
+    # 405 の応答には、許可されているメソッドを Allow ヘッダーで伝える必要がある
+    if error.valid_methods:
+        response.headers["Allow"] = ", ".join(error.valid_methods)
+    return response
+
+
+@app.errorhandler(429)
+def too_many_requests(error):
+    if is_api_request():
+        return jsonify({"error": "Too many requests."}), 429
+    return render_template("404.html", message="Too many requests."), 429
+
+
 @app.errorhandler(500)
 def internal_error(error):
     if is_api_request():
@@ -498,25 +588,49 @@ def internal_error(error):
 # Main
 # ============================================================
 if __name__ == "__main__":
-    # 本番では gunicorn/uvicorn 等のWSGIサーバを使い、
-    # リバースプロキシ (Nginx等) を挟む場合は ProxyFix を有効化してください。
-    # from werkzeug.middleware.proxy_fix import ProxyFix
-    # app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1)
+    # 本番では gunicorn 等のWSGIサーバを使います。
+    # リバースプロキシ (Nginx等) の背後では、環境変数 TRUSTED_PROXY_COUNT を設定してください (8.3 参照)。
     app.run(debug=False, host="127.0.0.1", port=5000)
 ```
+
+### 4.1 設計上のポイント
+
+#### エラー応答の形式
+
+`/api/` で始まるパスは、**常にJSON**を返します。それ以外のパスは、HTMLを返します。
+
+`Accept` ヘッダーで判定すると、ブラウザの画面でもエラーがJSONになります。ブラウザの `Accept` ヘッダー（`text/html,...,*/*;q=0.8`）には `*/*` が含まれ、これが `application/json` にも一致してしまうためです。
+
+405（許可されていないメソッド）と429（レート制限超過）にもハンドラを用意しています。ハンドラがないと、APIでもFlaskの標準のHTMLエラーページが返ります。
+
+#### 認証は最初に行う
+
+GitHub の `ping` も含め、すべてのリクエストで、最初に認証を行います。`ping` にも署名が付いているので、Secret の設定ミスは、`ping` が `401` になることで気づけます。
+
+#### GitHub のイベントの扱い
+
+`push` 以外のイベントや、コミットが空の `push`（ブランチ削除など）は、貼り付ける内容がありません。これらには `200` と `{"status": "ignored"}` を返します。`400` を返すと、GitHub 側で配信失敗と表示されるためです。
+
+#### 文字列の比較
+
+APIキー・署名・CSRFトークンの比較は、すべて `constant_time_equals()` を通します。`secrets.compare_digest()` に `str` を渡すと、ASCII文字だけでなければ `TypeError` になります。HTTPヘッダーは、利用者が自由に内容を決めて送れるので、非ASCII文字を送られると500エラーになります。UTF-8のバイト列にしてから比較すれば、これを避けられます。
+
+#### レート制限の掛け方
+
+`@limiter.limit(...)` でルートに制限を付けると、**そのルートでは `default_limits` が置き換えられます**。`override_defaults=False` を指定すると、`default_limits` に追加する形になります。このコードでは、すべて追加する形にしています。
 
 ---
 
 ## 5. 環境変数の設定と起動
 
-今回は3つの環境変数を設定する必要があります。
+今回は3つの環境変数を設定する必要があります。3つとも、推測されにくいランダムな値にしてください。
 
 ### Linux / macOS
 
 ```bash
 export FLASK_SECRET_KEY="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
-export PASTEBIN_API_KEY="my-super-secret-api-key-12345"
-export GITHUB_WEBHOOK_SECRET="my-github-webhook-secret"
+export PASTEBIN_API_KEY="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
+export GITHUB_WEBHOOK_SECRET="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
 python app.py
 ```
 
@@ -524,14 +638,36 @@ python app.py
 
 ```powershell
 $env:FLASK_SECRET_KEY = python -c "import secrets; print(secrets.token_urlsafe(32))"
-$env:PASTEBIN_API_KEY = "my-super-secret-api-key-12345"
-$env:GITHUB_WEBHOOK_SECRET = "my-github-webhook-secret"
+$env:PASTEBIN_API_KEY = python -c "import secrets; print(secrets.token_urlsafe(32))"
+$env:GITHUB_WEBHOOK_SECRET = python -c "import secrets; print(secrets.token_urlsafe(32))"
 python app.py
 ```
 
+`GITHUB_WEBHOOK_SECRET` は、GitHub の Webhook 設定の **Secret** 欄にも、同じ値を入力します（`echo "$GITHUB_WEBHOOK_SECRET"` で表示できます）。
+
+必要に応じて、次の環境変数も設定できます。
+
+| 環境変数 | 内容 |
+|----------|------|
+| `LIMITER_STORAGE` | レート制限の保存先（既定は `memory://`。本番は `redis://...`。8.1 参照） |
+| `TRUSTED_PROXY_COUNT` | リバースプロキシの段数（既定は `0`。8.3 参照） |
+| `FLASK_HTTPS` | `true` で Cookie の `Secure` 属性を有効にする（8.2 参照） |
+
 > **セキュアバイデフォルト**: `PASTEBIN_API_KEY` も `GITHUB_WEBHOOK_SECRET` も設定されていない場合、APIエンドポイントは `403 Forbidden` を返して完全に無効化されます。設定ミスによる事故防止になっています。
 
-> **レート制限の実効的な上限**: デフォルト制限 (`200/day`, `50/hour`) と API 制限 (`10/minute`) が**両方とも**適用されます。そのため実効的な上限は `1時間あたり最大50件` です。内部ツールの利用頻度に応じて `default_limits` や `@limiter.limit` の値を調整してください。また、GitHub Webhook の連続イベント (push のバースト等) で 429 が返る可性がある場合は、Webhook 経路の制限を緩くする等の調整が必要です。
+### レート制限の値
+
+制限は、IPアドレスごとに数えられます。
+
+| 対象 | 制限 |
+|------|------|
+| `POST /api/v1/paste` | 10件/分、50件/時間 |
+| `POST /`（フォームの投稿） | 10件/分、30件/時間 |
+| すべてのルート（閲覧など） | 200件/時間、1000件/日 |
+
+すべてのルートに共通の制限（最後の行）は、書き込みのルートにも**追加で**適用されます。そのため、APIの実効的な上限は、`1時間あたり最大50件` です。
+
+内部ツールの利用頻度に応じて、`default_limits`、`API_RATE_LIMIT`、`FORM_RATE_LIMIT` の値を調整してください。また、GitHub Webhook の連続イベント (push のバースト等) で 429 が返る可能性がある場合は、`API_RATE_LIMIT` を緩める調整が必要です。
 
 ---
 
@@ -542,7 +678,7 @@ python app.py
 ```bash
 curl -X POST http://127.0.0.1:5000/api/v1/paste \
   -H "Content-Type: application/json" \
-  -H "X-API-Key: my-super-secret-api-key-12345" \
+  -H "X-API-Key: $PASTEBIN_API_KEY" \
   -d '{"content": "print(\"Hello from API!\")", "language": "python"}'
 ```
 
@@ -565,7 +701,11 @@ GitHub リポジトリの Settings → Webhooks で以下を設定します。
 - **Content type**: `application/json`
 - **Secret**: `GITHUB_WEBHOOK_SECRET` と同じ値
 
-作成時に送られる `ping` イベントには `{"status": "pong"}` が返り、GitHub 側「緑のチェックマーク」がつきます。
+作成時に送られる `ping` イベントには `{"status": "pong"}` が返り、GitHub 側「緑のチェックマーク」がつきます。`ping` にも署名が付いているので、Secret が一致していない場合は `401` になり、GitHub 側で配信失敗と表示されます。
+
+**Which events would you like to trigger this webhook?** では、**Just the push event** を選ぶのがおすすめです。
+
+`push` 以外のイベントや、コミットが空の `push`（ブランチ削除など）が届いた場合は、`200` と `{"status": "ignored", ...}` を返して無視します。GitHub 側では、配信成功として扱われます。
 
 ### 6.3 エラーパターン
 
@@ -583,6 +723,10 @@ curl -X POST ... -H "X-API-Key: wrong-key" ...
 
 **レスポンス:** `413 Payload Too Large` と `{"error": "Payload Too Large", "max_bytes": 524288}`
 
+**レート制限を超えた:**
+
+**レスポンス:** `429 Too Many Requests` と `{"error": "Too many requests."}`
+
 ---
 
 ## 7. Pythonスクリプトからの利用例
@@ -590,16 +734,17 @@ curl -X POST ... -H "X-API-Key: wrong-key" ...
 CI/CDパイプラインや監視スクリプトから使う場合の例です。
 
 ```python
+import os
 import sys
 
 import requests
 
 WEBHOOK_URL = "http://127.0.0.1:5000/api/v1/paste"
-API_KEY = "my-super-secret-api-key-12345"
+API_KEY = os.environ["PASTEBIN_API_KEY"]  # コードに直接書かず、環境変数から読む
 
 
 def post_paste(content: str, language: str = "text") -> str:
-    """キストをPastebinに投稿し、ブラウザで開けるURLを返す。"""
+    """テキストをPastebinに投稿し、ブラウザで開けるURLを返す。"""
     response = requests.post(
         WEBHOOK_URL,
         headers={
@@ -609,7 +754,7 @@ def post_paste(content: str, language: str = "text") -> str:
         json={"content": content, "language": language},
         timeout=10,
     )
-    response.raise_for_status()  # 401/413 等はここで例外化
+    response.raise_for_status()  # 401/413/429 等はここで例外化
     data = response.json()
     print(f"Paste created: {data['url']}")
     return data["url"]
@@ -636,7 +781,7 @@ Paste created: http://127.0.0.1:5000/paste/xY3zA9QbLm
 
 ## 8. 本番運用時の必須セキュリティ対策
 
-### 8.1 ート制限のストレージ（Redis推奨）
+### 8.1 レート制限のストレージ（Redis推奨）
 
 開発環境では `memory://` で動作しますが、本番でGunicornなどで複数ワーカーを立ち上げた場合、プロセス間でカウンターが共有されず、レート制限が事実上無効化されてしまいます。
 
@@ -655,13 +800,48 @@ export LIMITER_STORAGE="redis://localhost:6379/0"
 
 これでどのワーカーがリクエストを処理しても、正確にリクエスト数がカウント・制限されるようになります。
 
-### 8.2 HTTPSの強制
+### 8.2 HTTPS環境での設定
 
-リバースプロキシ（Nginx等）の背後で動かす場合は `FLASK_HTTPS=true` を設定して、Cookieの `Secure` 属性を有効にしてください。
+HTTPS で公開する場合は `FLASK_HTTPS=true` を設定して、Cookieの `Secure` 属性を有効にしてください。
 
 ```bash
 export FLASK_HTTPS=true
 ```
+
+HTTPからHTTPSへの転送（リダイレクト）や、`Strict-Transport-Security` ヘッダーは、このアプリではなく、リバースプロキシ（Nginx等）側で設定します。
+
+### 8.3 リバースプロキシの背後で動かす場合
+
+Nginx等の背後でGunicornを動かすと、Flaskから見たリクエスト元のIPアドレスは、常にプロキシ（`127.0.0.1`）になります。レート制限はIPアドレスごとに数えるため、**すべての利用者が1つの枠を共有**してしまいます。1人が制限を使い切ると、他の利用者やGitHubからのWebhookも、1時間止まります。
+
+これを防ぐため、`TRUSTED_PROXY_COUNT` にプロキシの段数を設定します。
+
+```bash
+export TRUSTED_PROXY_COUNT=1   # Nginx が1段
+```
+
+Nginx側では、元のIPアドレスなどをヘッダーで渡します。
+
+```nginx
+location / {
+    proxy_pass http://127.0.0.1:8000;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Forwarded-Host $host;
+}
+```
+
+設定すると、次の2つが正しくなります。
+
+* レート制限が、利用者ごとのIPアドレスで数えられる
+* APIが返す `url` と `raw_url` が、`https://公開ホスト名/...` になる
+
+#### 注意：プロキシがないときは 0 のままにする
+
+プロキシがないのに `1` 以上にすると、クライアントが `X-Forwarded-For` ヘッダーを自由に偽装でき、リクエストごとに別のIPアドレスを名乗ってレート制限を回避できてしまいます。`TRUSTED_PROXY_COUNT` は、実際のプロキシの段数と、必ず一致させてください。
+
+また、`ProxyFix` はモジュールの読み込み時に適用します。`if __name__ == "__main__":` の中に書くと、Gunicornで起動したときには実行されず、設定が反映されません。
 
 ---
 
@@ -679,7 +859,7 @@ APIキーとWebhookシークレットを分離したことで、万が一どち�
 
 ## 10. 次のステップ: TTL（自動有効期限）機能の予告
 
-さらに機能を拡張するなら、**自動有効期限（TTL）機能**が非常に実用的です。
+さらに機能を拡張するなら、**自動有効期限（TTL）機能**が実用的です。
 
 ### なぜ `os.path.getmtime()` ではダメなのか
 
@@ -687,13 +867,35 @@ APIキーとWebhookシークレットを分離したことで、万が一どち�
 
 ### ファイルフォーマットの拡張
 
-既存の `言語\n本文` を拡張し、2行目に Unixtime の期限切れ時刻を入れます。期限なしの場合は `0` を書きます。
+期限を保存するために、ファイルの形式を拡張します。ただし、すでに保存されているPasteは、**旧形式（1行目が言語、2行目以降が本文）**のままです。新旧の形式を、見分けられるようにする必要があります。
 
-```
+そこで、新形式では、1行目に**形式を示す印**（`%%pastebin-v2`）を置きます。
+
+```text
+%%pastebin-v2
 python
 1699300000
 print("Hello, TTL!")
 ```
+
+| 行 | 内容 |
+|----|------|
+| 1行目 | 形式を示す印（`%%pastebin-v2`） |
+| 2行目 | 言語 |
+| 3行目 | 期限切れ時刻（Unixtime）。期限なしの場合は `0` |
+| 4行目以降 | 本文 |
+
+#### なぜ印が必要なのか
+
+印がなく、「2行目を期限として読む」とすると、旧形式のPasteで次の事故が起こります。旧形式の2行目は、本文の1行目だからです。
+
+| 旧形式の本文の1行目 | 起きること |
+|---------------------|------------|
+| 普通の文章 | 数値に変換できず、読めなくなる（404） |
+| `12345` | 過去の時刻とみなされ、**期限切れとしてファイルが削除される** |
+| `0` | 期限なしとみなされ、その行が本文から消える |
+
+旧形式の1行目は、必ず言語名（`python` など）なので、`%%pastebin-v2` と一致することはありません。印があれば、旧形式のPasteは、そのまま（期限なしで）読めます。移行のためにファイルを書き換える必要もありません。
 
 ### 実装スケッチ
 
@@ -701,30 +903,41 @@ print("Hello, TTL!")
 import time
 from typing import Optional, Tuple
 
+FORMAT_V2_MARKER = "%%pastebin-v2"
+MAX_EXPIRES_IN = 10 * 365 * 24 * 60 * 60  # 最大10年 (秒)
+
 
 def read_paste_with_ttl(paste_id: str) -> Tuple[str, str]:
     """
     ファイルを読み込み、(language, content) を返す。
-    期限切れなら 404 を送出する。
-    ファイル形式が壊れていても ValueError をキャッチして 404 にする。
+    - 旧形式 (印なし) は、期限なしとして読む
+    - 新形式 (印あり) は、期限をチェックする。期限切れなら 404 を送出する
+    - 新形式のヘッダーが壊れていれば 404 にする
     """
+    if not is_valid_paste_id(paste_id):
+        abort(404)
+
     file_path = os.path.join(PASTE_DIR, paste_id)
     if not os.path.isfile(file_path):
         abort(404)
 
     try:
         with open(file_path, "r", encoding="utf-8", newline="\n") as f:
+            first_line = f.readline().rstrip("\n")
+            if first_line != FORMAT_V2_MARKER:
+                # 旧形式: 1行目が言語、2行目以降が本文。期限なし。
+                return sanitize_language(first_line), f.read()
+
             language = f.readline().rstrip("\n")
             expires_line = f.readline().rstrip("\n")
             content = f.read()
     except (OSError, UnicodeError):
         abort(404)
 
-    # 期限チェック
     try:
         expires_at = int(expires_line)
     except ValueError:
-        abort(404)  # 壊れたファイルは存在しないものとして扱う
+        abort(404)  # ヘッダーが壊れたファイルは存在しないものとして扱う
 
     if expires_at != 0 and time.time() > expires_at:
         # 期限切れ: ファイルを削除して 404 を返す（クリーンアップ）
@@ -750,18 +963,23 @@ def save_paste_with_ttl(
     if not content:
         abort(400, description="Content is required.")
 
-    content_bytes = content.encode("utf-8")
-    if len(content_bytes) > MAX_PASTE_BYTES:
-        abort(413, description="Payload too large.")
+    validate_content_size(content)
 
     # 期限切れ時刻を計算 (0 = 期限なし)
     expires_at = 0
-    if expires_in is not None and expires_in > 0:
+    if expires_in is not None:
+        if (
+            isinstance(expires_in, bool)
+            or not isinstance(expires_in, int)
+            or not 0 < expires_in <= MAX_EXPIRES_IN
+        ):
+            abort(400, description="expires_in must be a positive integer (seconds).")
         expires_at = int(time.time()) + expires_in
 
     try:
         paste_id, file_path, file_object = create_paste_file()
         try:
+            file_object.write(FORMAT_V2_MARKER + "\n")
             file_object.write(language + "\n")
             file_object.write(str(expires_at) + "\n")
             file_object.write(content)
@@ -788,11 +1006,54 @@ def save_paste_with_ttl(
         abort(500, description="Unable to save paste.")
 ```
 
+### 閲覧のルートも置き換える
+
+`view_paste` と `raw_paste` は、4章のコードでは、ファイルの読み込みを、それぞれのルートの中に直接書いていました。TTL対応では、**両方**を `read_paste_with_ttl()` を使う形に置き換えます。
+
+```python
+@app.route("/paste/<paste_id>")
+def view_paste(paste_id):
+    language, content = read_paste_with_ttl(paste_id)
+
+    try:
+        lexer = get_lexer_by_name(language)
+    except ClassNotFound:
+        lexer = get_lexer_by_name("text")
+    formatter = HtmlFormatter(linenos=True, cssclass="highlight")
+    highlighted = highlight(content, lexer, formatter)
+    highlight_css = formatter.get_style_defs(".highlight")
+
+    return render_template(
+        "index.html",
+        paste_id=paste_id,
+        paste_language=language,
+        paste_content=highlighted,
+        highlight_css=highlight_css,
+        csrf_token=get_csrf_token(),
+        language_options=LANGUAGE_OPTIONS,
+    )
+
+
+@app.route("/raw/<paste_id>")
+def raw_paste(paste_id):
+    _, content = read_paste_with_ttl(paste_id)
+
+    response = app.response_class(content, status=200, mimetype="text/plain")
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    return response
+```
+
+片方だけ置き換えると、置き換え忘れたルートでは、期限が無視されるうえ、新形式のヘッダー（印・言語・期限）が本文として表示されてしまいます。ファイルを読むコードは、1つの関数にまとめておくのが安全です。
+
 ### ポイント
 
 - **明示的な期限保存**: `mtime` に依存せず、ファイル内の Unixtime で期限を管理
+- **旧形式との共存**: 1行目の印で新旧を見分け、旧形式のPasteは、書き換えずに期限なしで読める
 - **自己クリーンアップ**: 閲覧時に期限切れを検出したら即座にファイルを削除
-- **壊れたファイルへの耐性**: `ValueError` をキャッチして `404` にすることで、改竄や中途半端な書き込みに対して安全
+- **壊れたヘッダーへの対応**: 新形式で、期限の行が数値でなければ `404` にする
 - **期限なしとの区別**: `expires_at = 0` を「期限なし」のマーカーとして使う
+- **ルートの置き換え**: `view_paste` と `raw_paste` の両方で、同じ読み込み関数を使う
 
-この設計なら、閲覧時に都度チェックするだけでなく、cron で定期的に `pastes/` ディレクトリを走査して期限切れファイルを一掃するスクリプトも書けます。ファイルシステムベースでも、メタデータをファイル内に明示的に保存することで、データベース並みの堅牢性を実現できるんやで。
+この設計なら、閲覧時に都度チェックするだけでなく、cron で定期的に `pastes/` ディレクトリを走査して期限切れファイルを一掃するスクリプトも書けます。その場合も、印のない旧形式のファイルは、期限がないので削除の対象にしないでください。
+
+ファイルの中に期限を明示的に保存すれば、データベースなしでも期限の管理ができます。ただし、閲覧数のカウントや、一覧・検索など、より多くの情報が必要になったら、データベース（SQLite版のチュートリアル）の導入を検討してください。
