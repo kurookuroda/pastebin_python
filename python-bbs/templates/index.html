@@ -1,0 +1,40 @@
+{% extends "base.html" %}
+
+{% block content %}
+<section class="panel">
+    <h1 class="page-title">スレッド一覧</h1>
+
+    {% if threads %}
+    <ul class="thread-list">
+        {% for thread in threads %}
+        <li class="thread-item">
+            <span class="thread-no">{{ first_no + loop.index0 }}:</span>
+            <a class="thread-link" href="/thread/{{ thread.id }}">{{ thread.title }}</a>
+            <span class="thread-count">({{ thread.post_count }})</span>
+            <span class="thread-date">{{ thread.created_at | display_dt }}</span>
+        </li>
+        {% endfor %}
+    </ul>
+    {% else %}
+    <p class="empty">まだスレッドがありません。下のフォームから最初のスレッドを立てましょう。</p>
+    {% endif %}
+
+    <nav class="pager">
+        {% if page > 1 %}
+            <a href="/?page={{ page - 1 }}">← 前へ</a>
+        {% endif %}
+        <span class="pager-info">ページ {{ page }} / {{ total_pages }}</span>
+        {% if page < total_pages %}
+            <a href="/?page={{ page + 1 }}">次へ →</a>
+        {% endif %}
+    </nav>
+</section>
+
+<section class="panel">
+    <h2 class="form-title">新規スレッド作成</h2>
+    <form class="form" action="/thread" method="post">
+        <input type="text" name="title" placeholder="スレッドタイトル" maxlength="200" required>
+        <button type="submit">スレッドを立てる</button>
+    </form>
+</section>
+{% endblock %}

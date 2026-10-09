@@ -1,0 +1,43 @@
+/* Tailwindビルド用の入力。templates/_theme_tailwind.html の <style> と同じ内容（変更したら両方そろえる）。
+   ビルド: npx @tailwindcss/cli -i tailwind/input.css -o static/tailwind.css --minify */
+@import "tailwindcss";
+
+    @layer base {
+        body { @apply bg-[#efefef] text-neutral-800 leading-relaxed dark:bg-neutral-900 dark:text-neutral-200; }
+        a { @apply text-blue-700 visited:text-purple-800 hover:underline dark:text-blue-300 dark:visited:text-purple-300; }
+    }
+
+    @layer components {
+        .site-header { @apply bg-red-800 dark:bg-red-900; }
+        .site-header a { @apply mx-auto block max-w-4xl px-4 py-2.5 text-lg font-bold text-white no-underline visited:text-white; }
+        .container { @apply mx-auto my-4 max-w-4xl px-3; }
+        .breadcrumb { @apply mb-2 text-sm; }
+
+        .panel { @apply mb-4 border border-neutral-400 bg-white px-4 py-3 dark:border-neutral-600 dark:bg-neutral-800; }
+        .page-title, .thread-title { @apply mb-2.5 break-all border-b-2 border-red-800 pb-1.5 text-lg text-red-800 dark:border-red-400 dark:text-red-400; }
+        .form-title { @apply mb-2 text-base font-bold; }
+
+        .thread-list { @apply m-0 list-none p-0; }
+        .thread-item { @apply flex flex-wrap items-baseline gap-1.5 border-b border-dotted border-neutral-400 py-1.5; }
+        .thread-no { @apply min-w-10 text-right text-neutral-500; }
+        .thread-link { @apply break-all font-bold; }
+        .thread-count { @apply text-neutral-500; }
+        .thread-date { @apply ml-auto w-full text-xs text-neutral-500 sm:w-auto; }
+
+        .post { @apply border-b border-neutral-400 py-2 last-of-type:border-b-0 dark:border-neutral-600; }
+        .post-head { @apply text-[13px] text-neutral-500; }
+        .post-no { @apply mr-1.5 font-bold text-neutral-900 dark:text-neutral-100; }
+        .post-name { @apply font-bold text-green-700 dark:text-green-400; }
+        .post-date { @apply ml-2; }
+        .post-body { @apply mt-1.5 whitespace-pre-wrap break-words sm:ml-6; }
+
+        .pager { @apply mt-3 flex items-center gap-3; }
+        .pager-info { @apply text-[13px] text-neutral-500; }
+
+        .form input[type="text"], .form textarea { @apply mb-2 block w-full border border-neutral-400 bg-white px-2 py-1.5 text-neutral-900 dark:border-neutral-600 dark:bg-neutral-900 dark:text-neutral-100; }
+        .form textarea { @apply min-h-32 resize-y; }
+        .form button { @apply inline-block cursor-pointer border border-red-800 bg-red-800 px-5 py-1.5 text-white hover:opacity-85; }
+
+        .empty { @apply text-neutral-500; }
+        .site-footer { @apply mx-auto mb-6 max-w-4xl px-3 text-xs text-neutral-500; }
+    }

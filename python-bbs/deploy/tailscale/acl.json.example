@@ -1,0 +1,20 @@
+{
+  "tagOwners": {
+    "tag:bbs-admin": ["autogroup:admin"]
+  },
+  "acls": [
+    {
+      "action": "accept",
+      "src": ["tag:bbs-admin"],
+      "dst": ["tag:bbs-admin:22"]
+    }
+  ],
+  "ssh": [
+    {
+      "action": "check",
+      "src": ["tag:bbs-admin"],
+      "dst": ["tag:bbs-admin"],
+      "users": ["autogroup:nonroot", "root"]
+    }
+  ]
+}

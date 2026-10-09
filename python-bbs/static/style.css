@@ -1,0 +1,141 @@
+/* 掲示板風（クラシック）テーマ。外部ライブラリ・JavaScript不要の素のCSS。
+   色は :root の変数を変えるだけで差し替えられます。 */
+:root {
+    --bg: #efefef;
+    --panel: #ffffff;
+    --fg: #222222;
+    --muted: #666666;
+    --border: #b7b7b7;
+    --link: #0000cc;
+    --link-visited: #551a8b;
+    --accent: #b30000;
+    --name: #008000;
+}
+
+@media (prefers-color-scheme: dark) {
+    :root {
+        --bg: #1c1c1c;
+        --panel: #262626;
+        --fg: #e6e6e6;
+        --muted: #9a9a9a;
+        --border: #444444;
+        --link: #8ab4ff;
+        --link-visited: #c58af9;
+        --accent: #ff6b6b;
+        --name: #7ddc7d;
+    }
+}
+
+* { box-sizing: border-box; }
+
+body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font: 15px/1.7 "Hiragino Kaku Gothic ProN", "Yu Gothic", Meiryo, system-ui, sans-serif;
+}
+
+a { color: var(--link); }
+a:visited { color: var(--link-visited); }
+a:hover { text-decoration: underline; }
+
+/* ---- レイアウト ---- */
+.site-header { background: var(--accent); }
+.site-header a {
+    display: block;
+    max-width: 960px;
+    margin: 0 auto;
+    padding: 10px 16px;
+    color: #ffffff;
+    font-size: 18px;
+    font-weight: bold;
+    text-decoration: none;
+}
+
+.container { max-width: 960px; margin: 16px auto; padding: 0 12px; }
+.breadcrumb { margin-bottom: 8px; font-size: 14px; }
+
+.panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    padding: 12px 16px;
+    margin-bottom: 16px;
+}
+
+.page-title,
+.thread-title {
+    margin: 0 0 10px;
+    padding-bottom: 6px;
+    border-bottom: 2px solid var(--accent);
+    color: var(--accent);
+    font-size: 18px;
+    word-break: break-all;
+}
+.form-title { margin: 0 0 8px; font-size: 15px; }
+
+/* ---- スレッド一覧 ---- */
+.thread-list { list-style: none; margin: 0; padding: 0; }
+.thread-item {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 6px;
+    padding: 6px 0;
+    border-bottom: 1px dotted var(--border);
+}
+.thread-no { min-width: 2.5em; text-align: right; color: var(--muted); }
+.thread-link { font-weight: bold; word-break: break-all; }
+.thread-count { color: var(--muted); }
+.thread-date { margin-left: auto; color: var(--muted); font-size: 12px; }
+
+/* ---- レス ---- */
+.post { padding: 8px 0; border-bottom: 1px solid var(--border); }
+.post:last-of-type { border-bottom: 0; }
+.post-head { font-size: 13px; color: var(--muted); }
+.post-no { margin-right: 6px; font-weight: bold; color: var(--fg); }
+.post-name { color: var(--name); font-weight: bold; }
+.post-date { margin-left: 8px; }
+.post-body {
+    margin: 6px 0 0 1.5em;
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
+/* ---- ページ送り ---- */
+.pager { display: flex; align-items: center; gap: 12px; margin-top: 12px; }
+.pager-info { color: var(--muted); font-size: 13px; }
+
+/* ---- フォーム ---- */
+.form input[type="text"],
+.form textarea {
+    display: block;
+    width: 100%;
+    margin-bottom: 8px;
+    padding: 6px 8px;
+    border: 1px solid var(--border);
+    background: var(--panel);
+    color: var(--fg);
+    font: inherit;
+}
+.form textarea { min-height: 8em; resize: vertical; }
+.form button {
+    display: inline-block;
+    padding: 6px 20px;
+    border: 1px solid var(--accent);
+    background: var(--accent);
+    color: #ffffff;
+    font: inherit;
+    line-height: 1.4;
+    cursor: pointer;
+}
+.form button:hover { opacity: 0.85; }
+
+.empty { color: var(--muted); }
+.site-footer { max-width: 960px; margin: 0 auto 24px; padding: 0 12px; color: var(--muted); font-size: 12px; }
+
+/* ---- スマホ ---- */
+@media (max-width: 600px) {
+    .panel { padding: 10px 12px; }
+    .thread-date { margin-left: 0; width: 100%; }
+    .post-body { margin-left: 0; }
+}

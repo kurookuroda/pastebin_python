@@ -1,0 +1,39 @@
+{% extends "base.html" %}
+
+{% block title %}{{ thread.title }} - シンプル掲示板{% endblock %}
+
+{% block content %}
+<nav class="breadcrumb"><a href="/">← スレッド一覧に戻る</a></nav>
+
+<section class="panel">
+    <h1 class="thread-title">{{ thread.title }}</h1>
+
+    {% for post in posts %}
+    <article class="post" id="res{{ first_post_no + loop.index0 }}">
+        <div class="post-head">
+            <span class="post-no">{{ first_post_no + loop.index0 }}</span>
+            <span class="post-label">名前：</span><span class="post-name">{{ post.name }}</span>
+            <span class="post-date">{{ post.created_at | display_dt }}</span>
+        </div>
+        <p class="post-body">{{ post.body }}</p>
+    </article>
+    {% else %}
+    <p class="empty">まだレスがありません。最初の書き込みをしてみましょう。</p>
+    {% endfor %}
+
+    {% if has_next and last_post %}
+    <nav class="pager">
+        <a href="/thread/{{ thread.id }}?cursor_time={{ last_post.created_at | urlencode }}&amp;cursor_id={{ last_post.id }}&amp;start={{ next_post_no }}">次の{{ per_page }}件 →</a>
+    </nav>
+    {% endif %}
+</section>
+
+<section class="panel">
+    <h2 class="form-title">書き込む</h2>
+    <form class="form" action="/thread/{{ thread.id }}/post" method="post">
+        <input type="text" name="name" placeholder="名前（省略すると「名無しさん」）" maxlength="100">
+        <textarea name="body" placeholder="本文" maxlength="10000" required></textarea>
+        <button type="submit">書き込む</button>
+    </form>
+</section>
+{% endblock %}

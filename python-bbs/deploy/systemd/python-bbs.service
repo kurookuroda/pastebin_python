@@ -1,0 +1,47 @@
+# python-bbs を gunicorn(uvicorn worker) で起動するsystemdユニット。
+#
+# インストール:
+#   sudo cp deploy/systemd/python-bbs.service /etc/systemd/system/
+#   sudo cp deploy/systemd/python-bbs.env.example /etc/python-bbs.env   # 値を編集してから
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now python-bbs
+#
+# 待ち受けは 127.0.0.1 のみ。外部からの直接アクセスは不可能で、
+# 公開は Cloudflare Tunnel（cloudflared）経由のみに限定する。
+[Unit]
+Description=python-bbs (FastAPI simple board)
+After=network.target
+
+[Service]
+Type=simple
+User=bbs
+Group=bbs
+WorkingDirectory=/opt/python-bbs
+EnvironmentFile=/etc/python-bbs.env
+ExecStart=/opt/python-bbs/venv/bin/gunicorn main:app \
+    -k uvicorn.workers.UvicornWorker \
+    --workers 2 \
+    --bind 127.0.0.1:8000 \
+    --access-logfile - \
+    --error-logfile -
+Restart=on-failure
+RestartSec=3
+
+# --- セキュリティ強化（systemdのサンドボックス機能） ---
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/python-bbs/data
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictRealtime=true
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

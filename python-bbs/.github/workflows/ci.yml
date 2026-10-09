@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: requirements*.txt
+      - run: pip install -r requirements-dev.txt
+      - run: pytest -q
+
+  gunicorn-smoke-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - name: gunicorn(uvicorn worker) で起動して疎通確認
+        run: |
+          BBS_DB_PATH="$RUNNER_TEMP/smoke.db" \
+            python -m gunicorn main:app -k uvicorn.workers.UvicornWorker \
+            -w 2 -b 127.0.0.1:8000 --daemon \
+            --pid "$RUNNER_TEMP/gunicorn.pid" \
+            --error-logfile "$RUNNER_TEMP/gunicorn.log"
+          for i in $(seq 1 10); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/ || true)
+            [ "$code" = "200" ] && break
+            sleep 1
+          done
+          test "$code" = "200"
+          curl -s -o /dev/null -w '404 page: %{http_code}\n' http://127.0.0.1:8000/thread/abc
+          kill "$(cat "$RUNNER_TEMP/gunicorn.pid")"
+      - name: ログ出力（失敗時の手がかり）
+        if: always()
+        run: cat "$RUNNER_TEMP/gunicorn.log" || true
+
+  validate-deploy-configs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: systemdユニットの構文検証
+        run: |
+          sudo useradd --system --create-home --shell /usr/sbin/nologin bbs
+          sudo mkdir -p /opt/python-bbs/venv/bin /opt/python-bbs/data
+          sudo touch /opt/python-bbs/venv/bin/gunicorn
+          sudo chmod +x /opt/python-bbs/venv/bin/gunicorn
+          sudo chown -R bbs:bbs /opt/python-bbs
+          sudo touch /etc/python-bbs.env
+          systemd-analyze verify deploy/systemd/python-bbs.service
+      - name: cloudflared config.yml のYAML構文検証
+        run: python3 -c "import yaml; yaml.safe_load(open('deploy/cloudflared/config.yml'))"
+      - name: tailscale ACL例のJSON構文検証
+        run: python3 -c "import json; json.load(open('deploy/tailscale/acl.json.example'))"
+      - name: デプロイ用シェルスクリプトの構文検証
+        run: |
+          for f in deploy/scripts/*.sh; do
+            echo "checking $f"
+            bash -n "$f"
+          done

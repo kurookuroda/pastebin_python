@@ -1,0 +1,13 @@
+# cloudflared のトンネル設定。
+# `cloudflared tunnel create python-bbs` で作られる credentials-file のパスと
+# tunnel の UUID を、実際の値に書き換えること。
+# 配置先: /etc/cloudflared/config.yml
+tunnel: <TUNNEL_UUID>
+credentials-file: /etc/cloudflared/<TUNNEL_UUID>.json
+
+ingress:
+  # 公開ホスト名 → ローカルのgunicorn/uvicornへ
+  - hostname: bbs.example.com
+    service: http://127.0.0.1:8000
+  # 上のどれにも一致しないリクエストは閉じる（必須）
+  - service: http_status:404

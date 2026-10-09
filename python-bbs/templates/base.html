@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{% block title %}シンプル掲示板{% endblock %}</title>
+    {% if theme == "tailwind" %}
+        {% include "_theme_tailwind.html" %}
+    {% else %}
+        {# 絶対URLだとトンネル経由(https)で http:// になり得るので、ルート相対パスで書く #}
+        <link rel="stylesheet" href="/static/style.css">
+    {% endif %}
+    {% block head %}{% endblock %}
+</head>
+<body>
+    <header class="site-header">
+        <a href="/">シンプル掲示板</a>
+    </header>
+
+    <main class="container">
+        {% block content %}{% endblock %}
+    </main>
+
+    <footer class="site-footer">
+        時刻は {{ tz_label }} 表示です。
+    </footer>
+</body>
+</html>
